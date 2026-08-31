@@ -290,6 +290,47 @@ TEST(SocketStream, wait_writable_UNIX) {
   EXPECT_EQ(0, close(fds[0]));
 }
 
+TEST(SocketStream, writev_UNIX) {
+  int fds[2];
+  ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
+
+  // More spans than CPPHTTPLIB_WRITEV_MAX_BUFS exercises batching; a total
+  // several times the socket buffer exercises the partial-send resume logic.
+  std::vector<std::string> spans;
+  for (size_t i = 0; i < 2 * CPPHTTPLIB_WRITEV_MAX_BUFS + 3; i++) {
+    spans.emplace_back(1 + i * 25000, static_cast<char>('a' + i % 26));
+  }
+  std::vector<Stream::WriteBuffer> bufs;
+  std::string expected;
+  for (const auto &s : spans) {
+    bufs.push_back({s.data(), s.size()});
+    expected += s;
+  }
+
+  std::string received;
+  std::thread reader{[&] {
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(fds[1], buf, sizeof(buf), 0)) > 0) {
+      received.append(buf, static_cast<size_t>(n));
+    }
+  }};
+
+  detail::process_client_socket(
+      fds[0], 5, 0, 5, 0, 0, std::chrono::steady_clock::time_point::min(),
+      [&](Stream &strm) {
+        EXPECT_EQ(static_cast<ssize_t>(expected.size()),
+                  strm.writev(bufs.data(), bufs.size()));
+        return true;
+      });
+  EXPECT_EQ(0, close(fds[0])); // EOF ends the reader
+  reader.join();
+  EXPECT_EQ(0, close(fds[1]));
+
+  ASSERT_EQ(expected.size(), received.size());
+  EXPECT_TRUE(expected == received);
+}
+
 TEST(SocketStream, wait_writable_INET) {
   sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
@@ -353,6 +394,65 @@ TEST(SetSocketOptTest, TcpNoDelay) {
                             reinterpret_cast<char *>(&val), &len));
   EXPECT_NE(val, 0);
   detail::close_socket(sock);
+}
+
+TEST(AcceptErrorTest, RetryableFailuresAreClassifiedPerPlatform) {
+  // accept() reports failures through WSAGetLastError() on Windows and through
+  // errno everywhere else. Asking the wrong one is what made the accept loop
+  // treat every recoverable failure as fatal on Windows.
+  struct Classification {
+    bool resource;
+    bool transient;
+  };
+
+  auto classify = [](int err) {
+#ifdef _WIN32
+    WSASetLastError(err);
+#else
+    errno = err;
+#endif
+    // Read both before asserting: an assertion may clobber the error slot.
+    Classification c;
+    c.resource = detail::is_accept_resource_error();
+    c.transient = detail::is_accept_transient_error();
+    return c;
+  };
+
+#ifdef _WIN32
+  const std::vector<int> resource_errors = {WSAEMFILE, WSAENOBUFS};
+  const std::vector<int> transient_errors = {WSAEINTR, WSAEWOULDBLOCK,
+                                             WSAECONNRESET, WSAECONNABORTED};
+  const std::vector<int> fatal_errors = {WSAENOTSOCK, WSAEINVAL, WSAEOPNOTSUPP};
+#else
+  const std::vector<int> resource_errors = {EMFILE, ENFILE, ENOBUFS, ENOMEM};
+  const std::vector<int> transient_errors = {EINTR, EAGAIN, EWOULDBLOCK,
+                                             ECONNABORTED};
+  const std::vector<int> fatal_errors = {EBADF, EINVAL, ENOTSOCK};
+#endif
+
+  for (auto err : resource_errors) {
+    const auto c = classify(err);
+    EXPECT_TRUE(c.resource) << "error " << err;
+    EXPECT_FALSE(c.transient) << "error " << err;
+  }
+
+  for (auto err : transient_errors) {
+    const auto c = classify(err);
+    EXPECT_TRUE(c.transient) << "error " << err;
+    EXPECT_FALSE(c.resource) << "error " << err;
+  }
+
+  for (auto err : fatal_errors) {
+    const auto c = classify(err);
+    EXPECT_FALSE(c.resource) << "error " << err;
+    EXPECT_FALSE(c.transient) << "error " << err;
+  }
+
+#ifdef _WIN32
+  WSASetLastError(0);
+#else
+  errno = 0;
+#endif
 }
 
 TEST(ClientTest, MoveConstructible) {
@@ -719,6 +819,22 @@ TEST(DecodeUriTest, TestRoundTripWithEncodeUri) {
   EXPECT_EQ(decoded, original);
 }
 
+TEST(DecodeUriTest, KeepsReservedCharacterEscapes) {
+  // decode_uri is the inverse of encode_uri: an escaped reserved character
+  // stays encoded so it is not promoted into a real delimiter, while
+  // non-reserved escapes still decode (like JS decodeURI).
+  EXPECT_EQ(httplib::decode_uri("%2F"), "%2F");
+  EXPECT_EQ(httplib::decode_uri("%23"), "%23");
+  EXPECT_EQ(httplib::decode_uri("%3F%3A%40%26%3D%2B%24%2C%3B"),
+            "%3F%3A%40%26%3D%2B%24%2C%3B");
+  EXPECT_EQ(httplib::decode_uri("%2D"), "-");
+  EXPECT_EQ(httplib::decode_uri("%20"), " ");
+  EXPECT_EQ(httplib::decode_uri("http://example.com/a%2Fb"),
+            "http://example.com/a%2Fb");
+  // decode_uri_component still decodes the reserved character.
+  EXPECT_EQ(httplib::decode_uri_component("%2F"), "/");
+}
+
 TEST(DecodeUriComponentTest, TestRoundTripWithEncodeUriComponent) {
   string original = "Piri Tommy Villiers - on & on";
   string encoded = httplib::encode_uri_component(original);
@@ -992,14 +1108,6 @@ TEST(ParseAcceptHeaderTest, InvalidCases) {
   EXPECT_FALSE(
       detail::parse_accept_header("invalidtype,application/json", result));
 
-  // Empty media type
-  result.clear();
-  EXPECT_FALSE(detail::parse_accept_header(",application/json", result));
-
-  // Only commas
-  result.clear();
-  EXPECT_FALSE(detail::parse_accept_header(",,,", result));
-
   // Valid cases should still work
   EXPECT_TRUE(detail::parse_accept_header("*/*", result));
   EXPECT_EQ(result.size(), 1U);
@@ -1012,6 +1120,38 @@ TEST(ParseAcceptHeaderTest, InvalidCases) {
   EXPECT_TRUE(detail::parse_accept_header("text/*", result));
   EXPECT_EQ(result.size(), 1U);
   EXPECT_EQ(result[0], "text/*");
+}
+
+// RFC 9110 Section 5.6.1.2: a recipient has to parse and ignore empty list
+// elements, so a leading, trailing or doubled comma is a legal Accept value
+// and must not be answered with 400 Bad Request.
+TEST(ParseAcceptHeaderTest, EmptyListElementsAreIgnored) {
+  struct {
+    const char *value;
+    std::vector<std::string> expected;
+  } cases[] = {
+      {",application/json", {"application/json"}},
+      {"text/html,", {"text/html"}},
+      {"text/html,,*/*", {"text/html", "*/*"}},
+      // An empty element may be spelled with whitespace in it
+      {"text/html, , application/json", {"text/html", "application/json"}},
+      // Nothing but empty elements is an empty list, which means the same
+      // thing as no Accept header at all
+      {",,,", {}},
+      // Quality values still apply across ignored empty elements
+      {",text/html;q=0.5,,application/json", {"application/json", "text/html"}},
+  };
+
+  for (const auto &c : cases) {
+    std::vector<std::string> result;
+    EXPECT_TRUE(detail::parse_accept_header(c.value, result))
+        << "value: " << c.value;
+    EXPECT_EQ(c.expected, result) << "value: " << c.value;
+  }
+
+  // An invalid entry is still rejected when empty elements surround it
+  std::vector<std::string> result;
+  EXPECT_FALSE(detail::parse_accept_header(",invalidtype,", result));
 }
 
 TEST(ParseAcceptHeaderTest, ContentTypesPopulatedAndInvalidHeaderHandling) {
@@ -1494,6 +1634,143 @@ TEST(ParseMultipartBoundaryTest, ValueWithQuotesAndCharset) {
   EXPECT_EQ(boundary, "cpp-httplib-multipart-data");
 }
 
+TEST(ParseMultipartBoundaryTest, LongestAllowedValue) {
+  const string boundary(70, 'a');
+  string content_type = "multipart/form-data; boundary=" + boundary;
+  string parsed;
+  auto ret = detail::parse_multipart_boundary(content_type, parsed);
+  EXPECT_TRUE(ret);
+  EXPECT_EQ(parsed, boundary);
+}
+
+TEST(ParseMultipartBoundaryTest, ValueLongerThanRFCLimit) {
+  // RFC 2046 5.1.1 caps a boundary at 70 characters.
+  string content_type = "multipart/form-data; boundary=" + string(71, 'a');
+  string parsed;
+  auto ret = detail::parse_multipart_boundary(content_type, parsed);
+  EXPECT_FALSE(ret);
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedValueIsMeasuredAfterUnquoting) {
+  // The limit applies to the unquoted value, so a quoted 70 character boundary
+  // is 72 characters on the wire and still valid.
+  const string boundary(70, 'a');
+  string content_type = "multipart/form-data; boundary=\"" + boundary + "\"";
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(content_type, parsed));
+  EXPECT_EQ(parsed, boundary);
+
+  content_type = "multipart/form-data; boundary=\"" + string(71, 'a') + "\"";
+  parsed.clear();
+  EXPECT_FALSE(detail::parse_multipart_boundary(content_type, parsed));
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedValueWithEqualsSign) {
+  // RFC 2046 5.1.1 allows '=' in a boundary, so a MIME sender has to quote it.
+  // The parameter parser must not treat that '=' as the key/value separator.
+  string content_type =
+      "multipart/mixed; boundary=\"----=_NextPart_000_0000_01D9\"; "
+      "charset=UTF-8";
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(content_type, parsed));
+  EXPECT_EQ(parsed, "----=_NextPart_000_0000_01D9");
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedValueWithSemicolon) {
+  // A ';' inside the quoted-string is part of the value, not a parameter
+  // separator, so it must not truncate the boundary.
+  string content_type = "multipart/mixed; boundary=\"a;b\"; charset=UTF-8";
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(content_type, parsed));
+  EXPECT_EQ(parsed, "a;b");
+}
+
+TEST(ParseDispositionParamsTest, QuotedValues) {
+  // RFC 9110 Section 5.6.6: a parameter value may be a quoted-string, and
+  // ';' and '=' are ordinary characters inside one.
+  struct {
+    const char *value;
+    std::vector<std::pair<const char *, const char *>> expected;
+  } cases[] = {
+      {"name=\"file1\"; filename=\"a.txt\"",
+       {{"name", "file1"}, {"filename", "a.txt"}}},
+      // Whitespace around '=' and ';' is still trimmed
+      {"name=\"file2\" ;filename = \"a.html\"",
+       {{"name", "file2"}, {"filename", "a.html"}}},
+      // '=' inside the value used to leave only the text after the last one
+      {"name=\"file1\"; filename=\"report=v2.pdf\"",
+       {{"name", "file1"}, {"filename", "report=v2.pdf"}}},
+      {"name=\"x=y\"", {{"name", "x=y"}}},
+      // ';' inside the value used to truncate the pair and leave a bogus one
+      {"name=\"file3\"; filename=\"a;b.txt\"",
+       {{"name", "file3"}, {"filename", "a;b.txt"}}},
+      // An unquoted value keeps working, and so does filename*
+      {"filename*=UTF-8''%41.txt; filename=\"a.txt\"",
+       {{"filename*", "UTF-8''%41.txt"}, {"filename", "a.txt"}}},
+      // A parameter with no key is dropped rather than turned into one whose
+      // key is the value
+      {"=nokey; name=\"file5\"", {{"name", "file5"}}},
+  };
+
+  for (const auto &c : cases) {
+    Params params;
+    detail::parse_disposition_params(c.value, params);
+    for (const auto &kv : c.expected) {
+      auto it = params.find(kv.first);
+      ASSERT_NE(it, params.end())
+          << "value: " << c.value << ", key: " << kv.first;
+      EXPECT_EQ(kv.second, it->second) << "value: " << c.value;
+    }
+    EXPECT_EQ(c.expected.size(), params.size()) << "value: " << c.value;
+  }
+}
+
+TEST(ParseDispositionParamsTest, QuotedValuesSurviveTheRoundTrip) {
+  // escape_multipart_field() only escapes '"', CR and LF, so a name or
+  // filename holding '=' or ';' reaches the server's parameter parser as is.
+  Server svr;
+  std::string field_value, file_name, file_filename;
+  bool has_field = false, has_file = false;
+
+  svr.Post("/quoted", [&](const Request &req, Response &res) {
+    has_field = req.form.has_field("x=y");
+    field_value = req.form.get_field("x=y");
+
+    has_file = req.form.has_file("file1");
+    const auto &file = req.form.get_file("file1");
+    file_name = file.name;
+    file_filename = file.filename;
+
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  UploadFormDataItems items = {
+      {"x=y", "field-value", "", ""},
+      {"file1", "pdf-bytes", "a;b=report.pdf", "application/pdf"},
+  };
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/quoted", items);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  ASSERT_EQ(StatusCode::OK_200, res->status);
+
+  EXPECT_TRUE(has_field);
+  EXPECT_EQ("field-value", field_value);
+
+  EXPECT_TRUE(has_file);
+  EXPECT_EQ("file1", file_name);
+  EXPECT_EQ("a;b=report.pdf", file_filename);
+}
+
 TEST(GetHeaderValueTest, DefaultValue) {
   Headers headers = {{"Dummy", "Dummy"}};
   auto val = detail::get_header_value(headers, "Content-Type", "text/plain", 0);
@@ -1599,6 +1876,26 @@ TEST(GetHeaderValueTest, Range) {
     Headers headers = {make_range_header({{0, 0}, {-1, 1}})};
     auto val = detail::get_header_value(headers, "Range", 0, 0);
     EXPECT_STREQ("bytes=0-0, -1", val);
+  }
+}
+
+TEST(BearerTokenAuthTest, SchemeValidation) {
+  // A value shorter than "Bearer " must not throw from the fixed-length
+  // substr, and a non-Bearer scheme must not be reported as a token.
+  struct {
+    const char *value;
+    const char *expected;
+  } cases[] = {
+      {"x", ""},
+      {"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==", ""},
+      {"Bearer abc123", "abc123"},
+      {"bearer abc123", "abc123"}, // scheme match is case-insensitive
+  };
+
+  for (const auto &c : cases) {
+    Request req;
+    req.set_header("Authorization", c.value);
+    EXPECT_EQ(c.expected, get_bearer_token_auth(req)) << "value: " << c.value;
   }
 }
 
@@ -1917,6 +2214,89 @@ TEST(BufferStreamTest, read) {
   EXPECT_EQ('o', buf[0]);
 
   EXPECT_EQ(0, strm.read(buf, 1));
+}
+
+namespace {
+// Records write() calls into the generic Stream::writev() fallback. The call
+// count matters beyond syscall volume: for streams like TLS, every write() is
+// at least one record on the wire.
+struct WriteRecordingStream final : public Stream {
+  std::string buffer;
+  std::vector<size_t> write_sizes;
+
+  bool is_readable() const override { return false; }
+  bool wait_readable() const override { return false; }
+  bool wait_writable() const override { return true; }
+  ssize_t read(char *, size_t) override { return -1; }
+  ssize_t write(const char *ptr, size_t size) override {
+    write_sizes.push_back(size);
+    buffer.append(ptr, size);
+    return static_cast<ssize_t>(size);
+  }
+  void get_remote_ip_and_port(std::string &, int &) const override {}
+  void get_local_ip_and_port(std::string &, int &) const override {}
+  socket_t socket() const override { return INVALID_SOCKET; }
+  time_t duration() const override { return 0; }
+};
+} // namespace
+
+// Small totals coalesce into a single write.
+TEST(StreamWritevFallbackTest, coalesced) {
+  WriteRecordingStream strm;
+
+  const Stream::WriteBuffer bufs[3] = {{"foo", 3}, {"", 0}, {"barbaz", 6}};
+  EXPECT_EQ(9, strm.writev(bufs, 3));
+  EXPECT_EQ("foobarbaz", strm.buffer);
+  EXPECT_EQ(std::vector<size_t>{9}, strm.write_sizes);
+}
+
+// A total of at least a full staging buffer is written span by span, with
+// no flattening copy. (Many small spans summing large would emit one write
+// each; no caller produces that shape.)
+TEST(StreamWritevFallbackTest, largeTotalWritesPerSpan) {
+  WriteRecordingStream strm;
+
+  const std::string a(CPPHTTPLIB_SEND_BUFSIZ - 10, 'a');
+  const std::string b(CPPHTTPLIB_SEND_BUFSIZ - 10, 'b');
+  const Stream::WriteBuffer bufs[2] = {{a.data(), a.size()},
+                                       {b.data(), b.size()}};
+  EXPECT_EQ(static_cast<ssize_t>(a.size() + b.size()), strm.writev(bufs, 2));
+  EXPECT_EQ(a + b, strm.buffer);
+  EXPECT_EQ((std::vector<size_t>{CPPHTTPLIB_SEND_BUFSIZ - 10,
+                                 CPPHTTPLIB_SEND_BUFSIZ - 10}),
+            strm.write_sizes);
+}
+
+// A large span reaches write() whole, so the stream (e.g. OpenSSL) can
+// fragment it internally instead of taking a copy and a write() per
+// staging-buffer sized piece.
+TEST(StreamWritevFallbackTest, passthrough) {
+  WriteRecordingStream strm;
+
+  const std::string a(CPPHTTPLIB_SEND_BUFSIZ + 10, 'a');
+  const std::string b(20, 'b');
+  const Stream::WriteBuffer bufs[2] = {{a.data(), a.size()},
+                                       {b.data(), b.size()}};
+  EXPECT_EQ(static_cast<ssize_t>(a.size() + b.size()), strm.writev(bufs, 2));
+  EXPECT_EQ(a + b, strm.buffer);
+  EXPECT_EQ((std::vector<size_t>{CPPHTTPLIB_SEND_BUFSIZ + 10, 20}),
+            strm.write_sizes);
+}
+
+// The gather-write shape: small headers, then a large body. The headers go
+// out first on their own; the body reaches write() untouched.
+TEST(StreamWritevFallbackTest, headersThenLargeBody) {
+  WriteRecordingStream strm;
+
+  const std::string headers(100, 'h');
+  const std::string body(2 * CPPHTTPLIB_SEND_BUFSIZ, 'b');
+  const Stream::WriteBuffer bufs[2] = {{headers.data(), headers.size()},
+                                       {body.data(), body.size()}};
+  EXPECT_EQ(static_cast<ssize_t>(headers.size() + body.size()),
+            strm.writev(bufs, 2));
+  EXPECT_EQ(headers + body, strm.buffer);
+  EXPECT_EQ((std::vector<size_t>{100, 2 * CPPHTTPLIB_SEND_BUFSIZ}),
+            strm.write_sizes);
 }
 
 TEST(HostnameToIPConversionTest, HTTPWatch_Online) {
@@ -2851,6 +3231,115 @@ TEST(DigestAuthTest, FromHTTPWatch_Online) {
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
   }
+}
+
+// RFC 9110 Section 11.6.1: a WWW-Authenticate field value is a
+// comma-separated list of challenges, and each challenge may itself carry a
+// comma-separated auth-param list, so a server can legally offer Basic
+// before Digest, either as two field lines or packed into one. Runs one 401
+// -> Digest-retry round trip with the given field lines (get_combined_header_
+// value() joins them in receipt order) and checks that the retry carries a
+// well-formed Digest Authorization header naming expected_realm.
+static void
+run_digest_challenge_list_test(const std::vector<std::string> &challenges,
+                               const std::string &expected_realm) {
+  std::atomic<int> hits{0};
+
+  Server svr;
+  svr.Get("/x", [&](const Request &req, Response &res) {
+    if (++hits == 1) {
+      res.status = StatusCode::Unauthorized_401;
+      for (const auto &challenge : challenges) {
+        res.set_header("WWW-Authenticate", challenge);
+      }
+    } else {
+      auto authorization = req.get_header_value("Authorization");
+      EXPECT_EQ(0u, authorization.rfind("Digest ", 0));
+      EXPECT_NE(std::string::npos,
+                authorization.find("realm=\"" + expected_realm + "\""));
+      EXPECT_EQ(std::string::npos, authorization.find("Basic"));
+      res.set_content("ok", "text/plain");
+    }
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_digest_auth("hello", "world");
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  EXPECT_EQ(2, hits.load());
+}
+
+static const char *kBasicChallenge = "Basic realm=\"decoy\"";
+static const char *kDigestChallenge =
+    "Digest realm=\"testrealm\", qop=\"auth\", nonce=\"abc123\", "
+    "algorithm=MD5";
+
+TEST(DigestAuthTest, BasicChallengeListedBeforeDigest) {
+  run_digest_challenge_list_test({kBasicChallenge, kDigestChallenge},
+                                 "testrealm");
+}
+
+// Same challenge list with the schemes in the opposite order, to make sure
+// the fix above didn't just special-case "Basic first".
+TEST(DigestAuthTest, DigestChallengeListedBeforeBasic) {
+  run_digest_challenge_list_test({kDigestChallenge, kBasicChallenge},
+                                 "testrealm");
+}
+
+// A comma inside a quoted auth-param value must not be mistaken for the
+// separator between two challenges (or two auth-params).
+TEST(DigestAuthTest, RealmContainingCommaIsNotSplit) {
+  run_digest_challenge_list_test(
+      {"Digest realm=\"test,realm\", qop=\"auth\", nonce=\"abc123\", "
+       "algorithm=MD5"},
+      "test,realm");
+}
+
+// RFC 7616 Section 3.3 requires realm and nonce on every Digest challenge.
+// make_digest_authentication_header() dereferences both unconditionally, so
+// a server sending a challenge missing either one must not be treated as
+// usable -- doing so used to crash the client with std::out_of_range.
+static void run_digest_challenge_missing_field_test(const char *challenge) {
+  Server svr;
+  svr.Get("/x", [&](const Request & /*req*/, Response &res) {
+    res.status = StatusCode::Unauthorized_401;
+    res.set_header("WWW-Authenticate", challenge);
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_digest_auth("hello", "world");
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
+}
+
+TEST(DigestAuthTest, ChallengeMissingRealmAndNonceDoesNotCrash) {
+  run_digest_challenge_missing_field_test("Digest qop=\"auth\"");
+}
+
+TEST(DigestAuthTest, ChallengeMissingNonceDoesNotCrash) {
+  run_digest_challenge_missing_field_test("Digest realm=\"r\", qop=\"auth\"");
+}
+
+TEST(DigestAuthTest, ChallengeMissingRealmDoesNotCrash) {
+  run_digest_challenge_missing_field_test("Digest nonce=\"n\", qop=\"auth\"");
 }
 
 #endif
@@ -3874,6 +4363,19 @@ TEST(BindServerTest, BindAndListenSeparatelySSL) {
   svr.stop();
 }
 
+// SSLServer::is_valid() overrides the base version, so it has to chain to it
+// or a rejected CustomRoute() registration would not stop the server binding.
+TEST(BindServerTest, SSLServerIsInvalidAfterRejectedCustomRoute) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE,
+                CLIENT_CA_CERT_DIR);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.CustomRoute("GET", "/x", [](const Request &, Response &) {});
+
+  EXPECT_FALSE(svr.is_valid());
+  EXPECT_TRUE(svr.bind_to_any_port("0.0.0.0") < 0);
+}
+
 TEST(BindServerTest, BindAndListenSeparatelySSLEncryptedKey) {
   SSLServer svr(SERVER_ENCRYPTED_CERT_FILE, SERVER_ENCRYPTED_PRIVATE_KEY_FILE,
                 nullptr, nullptr, SERVER_ENCRYPTED_PRIVATE_KEY_PASS);
@@ -4136,6 +4638,279 @@ TEST(ExceptionTest, AndErrorHandler) {
     EXPECT_EQ("NOT_FOUND", res->body);
   }
 }
+#endif
+
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+// process_request() wraps only routing() in a try/catch, so an exception from
+// any other user callback used to unwind into the task queue - which does not
+// catch - and terminate the process. Each test below runs the server on a
+// single worker thread: a guard that catches the exception but still loses the
+// thread would otherwise be hidden by a spare worker serving the follow-up
+// request. Note that a regression here aborts the whole test binary rather
+// than failing one test.
+TEST(ServerExceptionTest, ThrowingContentProviderDoesNotKillTheServer) {
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) { reported++; }
+  });
+
+  svr.Get("/throw", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
+          sink.write("hello", 5);
+          throw std::runtime_error("from the content provider");
+        });
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/throw"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  // A request on a fresh connection is still served.
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+
+TEST(ServerExceptionTest, ThrowingPostRoutingHandlerDoesNotKillTheServer) {
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<bool> should_throw{true};
+
+  svr.Get("/hi", [](const Request & /*req*/, Response &res) {
+    res.set_content("hi", "text/plain");
+  });
+
+  svr.set_post_routing_handler(
+      [&](const Request & /*req*/, Response & /*res*/) {
+        if (should_throw) {
+          throw std::runtime_error("from the post-routing handler");
+        }
+      });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/hi"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+
+  should_throw = false;
+
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/hi");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("hi", res->body);
+  }
+}
+
+TEST(ServerExceptionTest, ThrowingErrorLoggerDoesNotReopenTheGuard) {
+  // The guard reports the caught exception through the error logger, which is
+  // a user callback too. A logger that throws has to be contained as well, or
+  // the process would terminate from inside the catch.
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) {
+      reported++;
+      throw std::runtime_error("from the error logger");
+    }
+  });
+
+  svr.Get("/throw", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
+          sink.write("hello", 5);
+          throw std::runtime_error("from the content provider");
+        });
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/throw"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+
+TEST(ServerExceptionTest, ThrowingWebSocketHandlerDoesNotKillTheServer) {
+  // A WebSocket handler runs on the upgrade path after the 101 has been sent,
+  // so the exception unwinds through the ws::WebSocket object on its way to
+  // the guard. None of the HTTP cases above cross that.
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) { reported++; }
+  });
+
+  svr.WebSocket("/ws", [](const Request & /*req*/, ws::WebSocket & /*ws*/) {
+    throw std::runtime_error("from the WebSocket handler");
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    ws::WebSocketClient client("ws://localhost:" + std::to_string(port) +
+                               "/ws");
+    auto res = client.connect();
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+    // The server dropped the connection instead of dying.
+    std::string msg;
+    EXPECT_FALSE(client.read(msg));
+    client.close();
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(ServerExceptionTest, ThrowingContentProviderDoesNotKillTheSSLServer) {
+  // SSLServer::process_and_close_socket() is a separate overload with its own
+  // guard, so it is exercised on its own.
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) { reported++; }
+  });
+
+  svr.Get("/throw", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
+          sink.write("hello", 5);
+          throw std::runtime_error("from the content provider");
+        });
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    SSLClient cli(HOST, port);
+    cli.enable_server_certificate_verification(false);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/throw"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  {
+    SSLClient cli(HOST, port);
+    cli.enable_server_certificate_verification(false);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+#endif
 #endif
 
 TEST(NoContentTest, ContentLength) {
@@ -5099,6 +5874,38 @@ protected:
                  [&](const Request & /*req*/, Response &res) {
                    res.set_header("Allow", "GET, POST, HEAD, OPTIONS");
                  })
+        .CustomRoute("PROPFIND", "/dav/:id",
+                     [&](const Request &req, Response &res) {
+                       res.set_header("x-body-size",
+                                      std::to_string(req.body.size()));
+                       res.set_header("x-matched-route", req.matched_route);
+                       res.set_header("x-dav-id", req.path_params.at("id"));
+                       res.status = StatusCode::MultiStatus_207;
+                       res.set_content(req.body, "application/xml");
+                     })
+        .CustomRoute("PROPFIND", R"(/dav-re/(\d+))",
+                     [&](const Request &req, Response &res) {
+                       res.set_header("x-dav-match", req.matches[1]);
+                       res.status = StatusCode::MultiStatus_207;
+                     })
+        .CustomRoute("MKCOL", "/dav-mkcol",
+                     [&](const Request &req, Response &res) {
+                       EXPECT_TRUE(req.body.empty());
+                       res.status = StatusCode::Created_201;
+                     })
+        .CustomRoute(
+            "REPORT", "/dav-report",
+            [&](const Request & /*req*/, Response &res,
+                const ContentReader &content_reader) {
+              std::string body;
+              content_reader([&](const char *data, size_t data_length) {
+                body.append(data, data_length);
+                return true;
+              });
+              res.set_header("x-body-size", std::to_string(body.size()));
+              res.status = StatusCode::MultiStatus_207;
+              res.set_content(body, "application/xml");
+            })
         .Get("/request-target",
              [&](const Request &req, Response & /*res*/) {
                EXPECT_EQ("/request-target?aaa=bbb&ccc=ddd", req.target);
@@ -5704,6 +6511,15 @@ TEST_F(ServerTest, GetMethodDirTest) {
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
   EXPECT_EQ("test.html", res->body);
+}
+
+TEST_F(ServerTest, GetMethodDirTestRangeNotSatisfiable) {
+  Headers headers = {make_range_header({{100, 199}})};
+  auto res = cli_.Get("/dir/test.html", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
+  EXPECT_EQ("0", res->get_header_value("Content-Length"));
+  EXPECT_EQ("", res->body);
 }
 
 TEST_F(ServerTest, GetMethodDirTestWithDoubleDots) {
@@ -7887,6 +8703,176 @@ TEST_F(ServerTest, BadRequestLineCancelsKeepAlive) {
   EXPECT_FALSE(cli_.is_socket_open());
 }
 
+TEST_F(ServerTest, CustomRouteReadsBody) {
+  const std::string xml =
+      R"(<?xml version="1.0"?><propfind><allprop/></propfind>)";
+
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav/dir";
+  req.set_header("Depth", "1");
+  req.body = xml;
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ(xml, res->body);
+  EXPECT_EQ(std::to_string(xml.size()), res->get_header_value("x-body-size"));
+  EXPECT_EQ("application/xml", res->get_header_value("Content-Type"));
+}
+
+TEST_F(ServerTest, CustomRouteMatchedRouteAndPathParams) {
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav/42";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ("/dav/:id", res->get_header_value("x-matched-route"));
+  EXPECT_EQ("42", res->get_header_value("x-dav-id"));
+}
+
+TEST_F(ServerTest, CustomRouteRegexPattern) {
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav-re/123";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ("123", res->get_header_value("x-dav-match"));
+}
+
+TEST_F(ServerTest, CustomRouteWithoutBody) {
+  Request req;
+  req.method = "MKCOL";
+  req.path = "/dav-mkcol";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::Created_201, res->status);
+}
+
+TEST_F(ServerTest, CustomRouteWithContentReader) {
+  const std::string xml = R"(<?xml version="1.0"?><sync-collection/>)";
+
+  Request req;
+  req.method = "REPORT";
+  req.path = "/dav-report";
+  req.body = xml;
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ(xml, res->body);
+}
+
+// A content reader route must fire even when the request carries no body,
+// the way the built-in Delete(pattern, HandlerWithContentReader) does.
+// Without that, a body-less PROPFIND-style request would fall through to 404.
+TEST_F(ServerTest, CustomRouteWithContentReaderWithoutBody) {
+  Request req;
+  req.method = "REPORT";
+  req.path = "/dav-report";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ("0", res->get_header_value("x-body-size"));
+}
+
+TEST_F(ServerTest, CustomRouteUnmatchedPathReturns404) {
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/not-dav";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST_F(ServerTest, CustomRouteUnregisteredMethodIsRejected) {
+  Request req;
+  req.method = "UNLOCK";
+  req.path = "/dav/dir";
+
+  cli_.set_keep_alive(true);
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
+  EXPECT_EQ("close", res->get_header_value("Connection"));
+  EXPECT_FALSE(cli_.is_socket_open());
+}
+
+TEST_F(ServerTest, CustomRouteDoesNotServeStaticFiles) {
+  // The mount point serves this path, but only for GET and HEAD.
+  auto get_res = cli_.Get("/dir/index.html");
+  ASSERT_TRUE(get_res) << "Error: " << to_string(get_res.error());
+  ASSERT_EQ(StatusCode::OK_200, get_res->status);
+
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dir/index.html";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST_F(ServerTest, CustomRouteKeepAlive) {
+  const std::string xml = R"(<?xml version="1.0"?><propfind/>)";
+
+  cli_.set_keep_alive(true);
+
+  for (auto i = 0; i < 2; i++) {
+    Request req;
+    req.method = "PROPFIND";
+    req.path = "/dav/dir";
+    req.body = xml;
+
+    auto res = cli_.send(req);
+
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+    EXPECT_EQ(xml, res->body);
+    EXPECT_TRUE(cli_.is_socket_open());
+  }
+
+  // A built-in method must still be served on the same connection.
+  cli_.set_keep_alive(false);
+
+  auto res = cli_.Get("/hi");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("close", res->get_header_value("Connection"));
+}
+
+TEST_F(ServerTest, CustomRouteExpect100Continue) {
+  const std::string xml = R"(<?xml version="1.0"?><propfind/>)";
+
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav/dir";
+  req.set_header("Expect", "100-continue");
+  req.body = xml;
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ(xml, res->body);
+}
+
 TEST_F(ServerTest, StartTime) { auto res = cli_.Get("/test-start-time"); }
 
 #ifdef CPPHTTPLIB_ZLIB_SUPPORT
@@ -8040,6 +9026,327 @@ TEST_F(ServerTest, MultipartFormDataGzip) {
 
   ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+#endif
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+// Static file compression is opt-in, so these run their own server rather than
+// flipping it on for the shared ServerTest fixture, which would silently
+// rewrite what every other static file test is asserting.
+class StaticFileCompressionTest : public ::testing::Test {
+protected:
+  void TearDown() override {
+    if (t_.joinable()) {
+      svr_.stop();
+      t_.join();
+    }
+  }
+
+  int start(const std::function<void(Server &)> &configure = nullptr) {
+    svr_.set_mount_point("/", "./www");
+
+    svr_.Get("/file_content", [](const Request & /*req*/, Response &res) {
+      res.set_file_content("./www/dir/index.html", "text/html");
+    });
+
+    svr_.Get("/streamed", [](const Request & /*req*/, Response &res) {
+      res.set_content_provider(
+          6, "text/plain",
+          [](size_t offset, size_t /*length*/, DataSink &sink) {
+            sink.write(offset < 3 ? "aaa" : "bbb", 3);
+            return true;
+          });
+    });
+
+    svr_.Get("/slow-stream", [](const Request & /*req*/, Response &res) {
+      res.set_content_provider(
+          1000, "text/plain",
+          [](size_t offset, size_t /*length*/, DataSink &sink) {
+            if (offset < 100) {
+              std::string data(100, 'A');
+              sink.write(data.data(), data.size());
+              return true;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::string data(900, 'B');
+            sink.write(data.data(), data.size());
+            return true;
+          });
+    });
+
+    if (configure) { configure(svr_); }
+
+    auto port = svr_.bind_to_any_port(HOST);
+    t_ = std::thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+    return port;
+  }
+
+  static void enable(Server &svr) { svr.set_static_file_compression(true); }
+
+  // Every file under ./www except 1MB.txt is smaller than the default
+  // 1400-byte floor, so a test that needs a small file compressed has to lower
+  // it out of the way.
+  static void enable_without_floor(Server &svr) {
+    svr.set_static_file_compression(true);
+    svr.set_static_file_compression_min_length(0);
+  }
+
+  Server svr_;
+  std::thread t_;
+};
+
+TEST_F(StaticFileCompressionTest, DisabledByDefault) {
+  auto port = start();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("1048576", res->get_header_value("Content-Length"));
+  EXPECT_EQ(1048576U, res->body.size());
+}
+
+TEST_F(StaticFileCompressionTest, MountPoint) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  auto res = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ("Accept-Encoding", res->get_header_value("Vary"));
+  // The response stays self-delimiting: a length, not a chunked body.
+  EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+  EXPECT_EQ(std::to_string(res->body.size()),
+            res->get_header_value("Content-Length"));
+  EXPECT_LT(res->body.size(), 1048576U);
+  EXPECT_FALSE(res->body.empty());
+}
+
+TEST_F(StaticFileCompressionTest, MountPointDecompressed) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ(1048576U, res->body.size());
+}
+
+TEST_F(StaticFileCompressionTest, FileContent) {
+  auto port = start(enable_without_floor);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/file_content", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ(104U, res->body.size());
+}
+
+TEST_F(StaticFileCompressionTest, Head) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  auto get = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(get) << "Error: " << to_string(get.error());
+
+  auto res = cli.Head("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+  // HEAD still reports the size a GET would return.
+  EXPECT_EQ(get->get_header_value("Content-Length"),
+            res->get_header_value("Content-Length"));
+  EXPECT_TRUE(res->body.empty());
+}
+
+TEST_F(StaticFileCompressionTest, RangeStaysIdentity) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/test.abcde", Headers{make_range_header({{2, 3}}),
+                                                {"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::PartialContent_206, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("2", res->get_header_value("Content-Length"));
+  EXPECT_EQ("bytes 2-3/5", res->get_header_value("Content-Range"));
+  EXPECT_EQ("cd", res->body);
+}
+
+TEST_F(StaticFileCompressionTest, NotCompressibleType) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/file", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("5", res->get_header_value("Content-Length"));
+}
+
+TEST_F(StaticFileCompressionTest, EmptyFile) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/empty_file", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("0", res->get_header_value("Content-Length"));
+  EXPECT_TRUE(res->body.empty());
+}
+
+TEST_F(StaticFileCompressionTest, MinLength) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+
+  // 104 bytes, well under the default floor. Compressing it would add the
+  // gzip header and trailer to a body that already fits in one packet.
+  auto res = cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("104", res->get_header_value("Content-Length"));
+}
+
+TEST_F(StaticFileCompressionTest, MinLengthLowered) {
+  auto port = start([](Server &svr) {
+    svr.set_static_file_compression(true);
+    svr.set_static_file_compression_min_length(1);
+  });
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+
+  auto res = cli.Get("/dir/test.html", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+
+  // A 9-byte file comes back larger than it went in, because gzip's header and
+  // trailer outweigh anything deflate can save. That is the end of the range
+  // the floor exists to keep out.
+  EXPECT_GT(res->body.size(), 9U);
+}
+
+TEST_F(StaticFileCompressionTest, MaxLength) {
+  auto port = start([](Server &svr) {
+    svr.set_static_file_compression(true);
+    svr.set_static_file_compression_min_length(0);
+    svr.set_static_file_compression_max_length(1024);
+  });
+
+  Client cli(HOST, port);
+
+  // Over the limit: served as is. Not named `big`/`small`: <rpcndr.h>
+  // defines `small` as a macro on Windows.
+  auto over = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(over) << "Error: " << to_string(over.error());
+  EXPECT_FALSE(over->has_header("Content-Encoding"));
+  EXPECT_EQ("1048576", over->get_header_value("Content-Length"));
+
+  // Under it: compressed.
+  auto under = cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(under) << "Error: " << to_string(under.error());
+  EXPECT_EQ("gzip", under->get_header_value("Content-Encoding"));
+}
+
+TEST_F(StaticFileCompressionTest, EtagPerEncoding) {
+  auto port = start(enable_without_floor);
+
+  Client cli(HOST, port);
+
+  auto identity = cli.Get("/dir/index.html", Headers{{"Accept-Encoding", ""}});
+  ASSERT_TRUE(identity) << "Error: " << to_string(identity.error());
+  EXPECT_FALSE(identity->has_header("Content-Encoding"));
+  auto identity_etag = identity->get_header_value("ETag");
+  ASSERT_FALSE(identity_etag.empty());
+
+  auto gzipped =
+      cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(gzipped) << "Error: " << to_string(gzipped.error());
+  EXPECT_EQ("gzip", gzipped->get_header_value("Content-Encoding"));
+  auto gzip_etag = gzipped->get_header_value("ETag");
+  ASSERT_FALSE(gzip_etag.empty());
+
+  // Two representations, two validators.
+  EXPECT_NE(identity_etag, gzip_etag);
+
+  // Each one revalidates against the request that would produce it...
+  auto fresh =
+      cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"},
+                                         {"If-None-Match", gzip_etag}});
+  ASSERT_TRUE(fresh) << "Error: " << to_string(fresh.error());
+  EXPECT_EQ(StatusCode::NotModified_304, fresh->status);
+
+  auto fresh_identity =
+      cli.Get("/dir/index.html", Headers{{"Accept-Encoding", ""},
+                                         {"If-None-Match", identity_etag}});
+  ASSERT_TRUE(fresh_identity) << "Error: " << to_string(fresh_identity.error());
+  EXPECT_EQ(StatusCode::NotModified_304, fresh_identity->status);
+
+  // ...and not against the other representation.
+  auto crossed =
+      cli.Get("/dir/index.html",
+              Headers{{"Accept-Encoding", ""}, {"If-None-Match", gzip_etag}});
+  ASSERT_TRUE(crossed) << "Error: " << to_string(crossed.error());
+  EXPECT_EQ(StatusCode::OK_200, crossed->status);
+}
+
+// The opt-in covers responses the server reads off disk itself. A caller's own
+// known-length provider keeps its Content-Length and, more importantly, keeps
+// delivering incrementally: routing it through a compressor would hold every
+// write back until zlib's window filled.
+TEST_F(StaticFileCompressionTest, KnownLengthProviderUnaffected) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/streamed", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("6", res->get_header_value("Content-Length"));
+  EXPECT_EQ("aaabbb", res->body);
+}
+
+TEST_F(StaticFileCompressionTest, IncrementalProviderUnaffected) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(1, 0);
+
+  auto handle = cli.open_stream("GET", "/slow-stream", Params{},
+                                Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(handle.is_valid());
+
+  // The provider writes 100 bytes and then stalls for longer than the read
+  // timeout. Those first bytes have to arrive anyway: run the response through
+  // a compressor and zlib holds them until its window fills, so the read would
+  // come back empty instead.
+  char buf[256];
+  auto n = handle.read(buf, sizeof(buf));
+  ASSERT_GT(n, 0) << "first read should return the bytes already written";
+  EXPECT_EQ(std::string(100, 'A'), std::string(buf, static_cast<size_t>(n)));
 }
 #endif
 
@@ -8543,9 +9850,13 @@ TEST(ZstdDecompressor, Decompress) {
 }
 #endif
 
-// Sends a raw request to a server listening at HOST:PORT.
-static bool send_request(time_t read_timeout_sec, const std::string &req,
-                         std::string *resp = nullptr, int port = PORT) {
+// Sends a raw request to a server listening at HOST:PORT, writing it in
+// separate chunks so that the server sees each part in its own read(). Used to
+// place a read boundary at a specific offset of a request body.
+static bool send_request_in_parts(time_t read_timeout_sec,
+                                  const std::vector<std::string> &parts,
+                                  std::string *resp = nullptr,
+                                  int port = PORT) {
   auto error = Error::Success;
 
   auto client_sock = detail::create_client_socket(
@@ -8559,9 +9870,15 @@ static bool send_request(time_t read_timeout_sec, const std::string &req,
   auto ret = detail::process_client_socket(
       client_sock, read_timeout_sec, 0, 0, 0, 0,
       std::chrono::steady_clock::time_point::min(), [&](Stream &strm) {
-        if (req.size() !=
-            static_cast<size_t>(strm.write(req.data(), req.size()))) {
-          return false;
+        for (size_t i = 0; i < parts.size(); i++) {
+          const auto &part = parts[i];
+          if (part.size() !=
+              static_cast<size_t>(strm.write(part.data(), part.size()))) {
+            return false;
+          }
+          if (i + 1 < parts.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
         }
 
         char buf[512];
@@ -8576,6 +9893,12 @@ static bool send_request(time_t read_timeout_sec, const std::string &req,
   detail::close_socket(client_sock);
 
   return ret;
+}
+
+// Sends a raw request to a server listening at HOST:PORT.
+static bool send_request(time_t read_timeout_sec, const std::string &req,
+                         std::string *resp = nullptr, int port = PORT) {
+  return send_request_in_parts(read_timeout_sec, {req}, resp, port);
 }
 
 TEST(ServerRequestParsingTest, TrimWhitespaceFromHeaderValues) {
@@ -8857,6 +10180,10 @@ static void test_raw_request(const std::string &req,
           [&](const Request & /*req*/, Response &res) {
             res.set_content("ok", "text/plain");
           });
+  svr.CustomRoute("PROPFIND", "/dav",
+                  [&](const Request & /*req*/, Response &res) {
+                    res.status = StatusCode::MultiStatus_207;
+                  });
 
   // Server read timeout must be longer than the client read timeout for the
   // bug to reproduce, probably to force the server to process a request
@@ -9011,6 +10338,81 @@ TEST(ServerRequestParsingTest, RemoteAddrSetOnBadRequest) {
   std::string out;
   ASSERT_TRUE(send_request(5, bad_req, &out));
   EXPECT_EQ("HTTP/1.1 400 Bad Request", out.substr(0, 24));
+}
+
+// A custom method with neither Content-Length nor Transfer-Encoding must be
+// answered right away rather than blocking on a read that waits for EOF.
+TEST(ServerRequestParsingTest, CustomMethodWithoutFraming) {
+  std::string out;
+  test_raw_request("PROPFIND /dav HTTP/1.1\r\nHost: localhost\r\n\r\n", &out);
+  EXPECT_EQ("HTTP/1.1 207 Multi-Status", out.substr(0, 25));
+}
+
+TEST(CustomRouteRegistrationTest, RejectsBuiltInMethods) {
+  const char *methods[] = {"GET",     "HEAD",    "POST",  "PUT",   "DELETE",
+                           "CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI"};
+
+  for (const auto *method : methods) {
+    Server svr;
+    svr.CustomRoute(method, "/x", [](const Request &, Response &) {});
+
+    EXPECT_FALSE(svr.is_valid()) << method;
+    EXPECT_FALSE(svr.listen(HOST, PORT)) << method;
+  }
+}
+
+TEST(CustomRouteRegistrationTest, RejectsNonTokenMethods) {
+  const char *methods[] = {"",          "PRO PFIND", "PROP\tFIND", "PROP/FIND",
+                           "PROP,FIND", "PROP:FIND", "PROP(FIND)", "\x01FIND"};
+
+  for (const auto *method : methods) {
+    Server svr;
+    svr.CustomRoute(method, "/x", [](const Request &, Response &) {});
+
+    EXPECT_FALSE(svr.is_valid()) << method;
+  }
+}
+
+TEST(CustomRouteRegistrationTest, AcceptsWebDavAndUpnpMethods) {
+  const char *methods[] = {"PROPFIND", "PROPPATCH", "MKCOL",
+                           "COPY",     "MOVE",      "LOCK",
+                           "UNLOCK",   "REPORT",    "SUBSCRIBE"};
+
+  Server svr;
+  for (const auto *method : methods) {
+    svr.CustomRoute(method, "/x", [](const Request &, Response &) {});
+  }
+
+  EXPECT_TRUE(svr.is_valid());
+}
+
+TEST(CustomRouteRegistrationTest, ContentReaderOverloadRejectsBuiltInMethods) {
+  Server svr;
+  svr.CustomRoute("POST", "/x",
+                  [](const Request &, Response &, const ContentReader &) {});
+
+  EXPECT_FALSE(svr.is_valid());
+}
+
+TEST(CustomRouteRegistrationTest, RejectionIsSticky) {
+  Server svr;
+  svr.CustomRoute("PROPFIND", "/a", [](const Request &, Response &) {});
+  svr.CustomRoute("GET", "/b", [](const Request &, Response &) {});
+  svr.CustomRoute("MKCOL", "/c", [](const Request &, Response &) {});
+
+  EXPECT_FALSE(svr.is_valid());
+}
+
+TEST(CustomRouteRegistrationTest, ReportsRejectionToErrorLogger) {
+  Server svr;
+
+  auto captured = Error::Success;
+  svr.set_error_logger(
+      [&](const Error &err, const Request * /*req*/) { captured = err; });
+
+  svr.CustomRoute("POST", "/x", [](const Request &, Response &) {});
+
+  EXPECT_EQ(Error::InvalidHTTPMethod, captured);
 }
 
 TEST(ServerRequestParsingTest, InvalidFieldValueContains_CR_LF_NUL) {
@@ -9551,6 +10953,49 @@ TEST(DownloadProgressTest, GetWithContentReceiver) {
       "/download-receiver", 2000u);
 }
 
+TEST(StreamingTest, ChunkedZeroLengthWriteDoesNotEndTheBody) {
+  // A provider reaching a pass with nothing to hand over - an empty buffer
+  // popped off a queue, say - must not be taken to mean the body is finished.
+  // It used to end the loop with the terminating chunk unwritten while the
+  // server still considered the response complete, so the peer waited for an
+  // end that never arrived.
+  Server svr;
+
+  svr.Get("/stream", [](const Request & /*req*/, Response &res) {
+    auto step = std::make_shared<int>(0);
+    res.set_chunked_content_provider("text/plain",
+                                     [step](size_t /*offset*/, DataSink &sink) {
+                                       switch ((*step)++) {
+                                       case 0: sink.write("", 0); break;
+                                       case 1: sink.write("hello", 5); break;
+                                       default: sink.done(); break;
+                                       }
+                                       return true;
+                                     });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto listen_se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  // Without the fix the body is never terminated, so bound the wait rather
+  // than letting the test hang on the default read timeout.
+  cli.set_read_timeout(5, 0);
+
+  auto res = cli.Get("/stream");
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("hello", res->body);
+}
+
 TEST(StreamingTest, NoContentLengthStreaming) {
   Server svr;
 
@@ -9633,6 +11078,273 @@ TEST(MountTest, Unmount) {
   res = cli.Get("/mount2/dir/test.html");
   ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST(BorrowedContentTest, ServeAndRelease) {
+  Server svr;
+
+  const std::string data = "0123456789abcdefghij";
+  std::atomic<int> released{0};
+  std::atomic<int> released_ok{0};
+
+  svr.Get("/view", [&](const Request & /*req*/, Response &res) {
+    res.set_content(data.data(), data.size(), "text/plain", [&](bool ok) {
+      released++;
+      if (ok) { released_ok++; }
+    });
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen("localhost", PORT); });
+  svr.wait_until_ready();
+
+  {
+    Client cli("localhost", PORT);
+    cli.set_keep_alive(true);
+
+    auto res = cli.Get("/view");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
+    EXPECT_EQ("20", res->get_header_value("Content-Length"));
+    EXPECT_EQ(data, res->body);
+
+    res = cli.Head("/view");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("20", res->get_header_value("Content-Length"));
+    EXPECT_EQ("", res->body);
+
+    Headers range_headers = {make_range_header({{5, 8}})};
+    res = cli.Get("/view", range_headers);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::PartialContent_206, res->status);
+    EXPECT_EQ("bytes 5-8/20", res->get_header_value("Content-Range"));
+    EXPECT_EQ("5678", res->body);
+
+    // An unsatisfiable range drops the borrowed view; nothing may trail the
+    // 416 on this kept-alive connection.
+    Headers bad_range_headers = {make_range_header({{100, 199}})};
+    res = cli.Get("/view", bad_range_headers);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
+    EXPECT_EQ("", res->body);
+
+    res = cli.Get("/view");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(data, res->body);
+  }
+
+  svr.stop();
+  listen_thread.join();
+
+  // One release per response; the flag reports whether the borrowed bytes
+  // were delivered (HEAD and the 416 never send them).
+  EXPECT_EQ(5, released.load());
+  EXPECT_EQ(3, released_ok.load());
+}
+
+#ifndef _WIN32
+// A Content-Length-honoring client cannot see bytes leaked after the header
+// block (a 416 always closes the connection), so verify at the socket level
+// that the 416 for a borrowed view carries no body at all.
+TEST(BorrowedContentTest, RangeNotSatisfiableLeavesNoStrayBytes) {
+  Server svr;
+
+  const std::string data = "0123456789abcdefghij";
+  svr.Get("/view", [&](const Request & /*req*/, Response &res) {
+    res.set_content(data.data(), data.size(), "text/plain", nullptr);
+  });
+
+  // Bind the loopback IPv4 address explicitly; the raw client below
+  // connects to INADDR_LOOPBACK.
+  auto listen_thread = std::thread([&svr]() { svr.listen("127.0.0.1", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  const int sock = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_LE(0, sock);
+  sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(PORT));
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(0,
+            connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+
+  const std::string request = "GET /view HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
+                              "Range: bytes=100-199\r\n"
+                              "Connection: close\r\n"
+                              "\r\n";
+  ASSERT_EQ(static_cast<ssize_t>(request.size()),
+            send(sock, request.data(), request.size(), 0));
+
+  std::string response;
+  char buf[4096];
+  ssize_t n;
+  while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
+    response.append(buf, static_cast<size_t>(n));
+  }
+  close(sock);
+
+  EXPECT_EQ(0u, response.find("HTTP/1.1 416 "));
+  const auto header_end = response.find("\r\n\r\n");
+  ASSERT_NE(std::string::npos, header_end);
+  EXPECT_EQ(response.size(), header_end + 4);
+}
+#endif
+
+TEST(BorrowedContentTest, ErrorHandlerReplacesBorrowedContent) {
+  Server svr;
+
+  const std::string data = "borrowed bytes";
+  svr.Get("/fail", [&](const Request & /*req*/, Response &res) {
+    res.set_content(data.data(), data.size(), "text/plain", nullptr);
+    res.status = StatusCode::InternalServerError_500;
+  });
+  svr.set_error_handler([](const Request & /*req*/, Response &res) {
+    res.set_content("error body", "text/html");
+    return Server::HandlerResponse::Handled;
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  auto res = cli.Get("/fail");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
+  EXPECT_EQ("error body", res->body);
+}
+
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+TEST(BorrowedContentTest, ExceptionDropsBorrowedContent) {
+  Server svr;
+
+  const std::string data = "borrowed bytes";
+  svr.Get("/throw", [&](const Request & /*req*/, Response &res) {
+    res.set_content(data.data(), data.size(), "text/plain", nullptr);
+    throw std::runtime_error("boom");
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  auto res = cli.Get("/throw");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
+  EXPECT_EQ("0", res->get_header_value("Content-Length"));
+  EXPECT_EQ("", res->body);
+}
+#endif
+
+TEST(BorrowedContentTest, ReplacingViewWithEmptyBodyClearsContentLength) {
+  Server svr;
+
+  const std::string data = "0123456789abcdefghij"; // 20 bytes
+  svr.Get("/replaced", [&](const Request & /*req*/, Response &res) {
+    res.set_content(data.data(), data.size(), "text/plain", nullptr);
+    res.set_content("", "text/plain"); // drop it again
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  cli.set_read_timeout(1, 0);
+
+  auto res = cli.Get("/replaced");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("0", res->get_header_value("Content-Length"));
+  EXPECT_EQ("", res->body);
+}
+
+TEST(BorrowedContentTest, ReplacingContentReleasesTheOldView) {
+  Server svr;
+
+  const std::string a = "AAAA";
+  const std::string b = "BBBB";
+  std::atomic<int> released_a{0};
+
+  svr.Get("/twice", [&](const Request & /*req*/, Response &res) {
+    res.set_content(a.data(), a.size(), "text/plain",
+                    [&](bool) { released_a++; });
+    res.set_content(b.data(), b.size(), "text/plain", nullptr);
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  auto res = cli.Get("/twice");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("BBBB", res->body);
+  EXPECT_EQ(1, released_a.load()); // the discarded view is still released
+}
+
+TEST(BorrowedContentTest, ReplacingViewWithProviderReleasesTheOldView) {
+  Server svr;
+
+  const std::string a = "AAAA";
+  std::atomic<int> released_a{0};
+
+  svr.Get("/provided", [&](const Request & /*req*/, Response &res) {
+    res.set_content(a.data(), a.size(), "text/plain",
+                    [&](bool) { released_a++; });
+    res.set_content_provider(4, "text/plain",
+                             [](size_t offset, size_t length, DataSink &sink) {
+                               return sink.write("BBBB" + offset, length);
+                             });
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  auto res = cli.Get("/provided");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("BBBB", res->body);
+  EXPECT_EQ(1, released_a.load()); // the discarded view is still released
+}
+
+TEST(BorrowedContentTest, CopiedResponseSharesTheReleaser) {
+  int released = 0;
+  {
+    Response res;
+    const std::string data = "AAAA";
+    res.set_content(data.data(), data.size(), "text/plain",
+                    [&](bool) { released++; });
+    {
+      Response copy = res; // copies share ownership; no double-release
+      EXPECT_EQ(0, released);
+    }
+    EXPECT_EQ(0, released); // still owned by the original
+  }
+  EXPECT_EQ(1, released); // released exactly once, by the last owner
 }
 
 TEST(MountTest, PathSegmentBoundary) {
@@ -10100,6 +11812,159 @@ TEST(ClientProblemDetectionTest, ContentProvider) {
     ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   }
 }
+
+TEST(ContentProviderTest, ProviderMakingNoProgressFails) {
+  // A provider that reports success without writing anything and without
+  // calling done() used to be handed the same offset and length again on every
+  // pass, so it spun for as long as the peer stayed connected.
+  Server svr;
+
+  svr.Post("/", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  std::atomic<int> call_count{0};
+
+  Client cli(HOST, port);
+  auto res = cli.Post(
+      "/", 1024,
+      [&](size_t /*offset*/, size_t /*length*/, DataSink & /*sink*/) {
+        // Give up after enough passes to show the spin, so that losing the
+        // check below fails this test instead of hanging it.
+        return ++call_count < 100;
+      },
+      "text/plain");
+
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::Write, res.error());
+  EXPECT_EQ(1, call_count.load());
+}
+
+TEST(DataSinkTest, OptionalCallbacksAreCallableByDefault) {
+  // A writer only has to assign `write`. The other three used to be left as
+  // empty std::functions, so a provider calling one threw
+  // std::bad_function_call out of the thread running it and took the whole
+  // process down.
+  DataSink sink;
+
+  std::string written;
+  sink.write = [&](const char *data, size_t data_len) {
+    written.append(data, data_len);
+    return true;
+  };
+
+  EXPECT_TRUE(sink.is_writable());
+  sink.done();
+  sink.done_with_trailer(Headers{{"X-Trailer", "value"}});
+  EXPECT_TRUE(written.empty());
+}
+
+TEST(DataSinkTest, DoneWithTrailerFallsBackToDone) {
+  // A sink that cannot carry trailers still has to finish.
+  DataSink sink;
+
+  auto done_count = 0;
+  sink.done = [&]() { done_count++; };
+
+  sink.done_with_trailer(Headers{{"X-Trailer", "value"}});
+  EXPECT_EQ(1, done_count);
+}
+
+TEST(DataSinkTest, LengthFramedProviderMayCallDoneAfterWritingEverything) {
+  Server svr;
+
+  const std::string body(4096, 'x');
+
+  svr.Get("/", [&](const Request & /*req*/, Response &res) {
+    res.set_content_provider(body.size(), "text/plain",
+                             [&](size_t offset, size_t length, DataSink &sink) {
+                               sink.write(body.data() + offset, length);
+                               sink.done();
+                               return true;
+                             });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/");
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(body, res->body);
+}
+
+TEST(DataSinkTest, LengthFramedProviderThatFinishesEarlyFailsTheResponse) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+          sink.write("hello", 5);
+          sink.done(); // short of the 1024 bytes the response promised
+          return true;
+        });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(5, 0);
+
+  // The response is short of its Content-Length, so the client cannot read a
+  // complete body. What matters is that this returns at all: a no-op done()
+  // would leave the writer looping over a provider that never makes progress.
+  auto res = cli.Get("/");
+  EXPECT_FALSE(res);
+}
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+TEST(DataSinkTest, CompressedRequestProviderThatFinishesEarlyFails) {
+  // The compressed path builds the whole body before connecting, so this
+  // fails client-side and never reaches a server.
+  Client cli(HOST, PORT);
+  cli.set_compress(true);
+
+  auto res = cli.Post(
+      "/", 1024,
+      [](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+        sink.write("hello", 5);
+        sink.done(); // short of the 1024 bytes the request announced
+        return true;
+      },
+      "text/plain");
+
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::Write, res.error());
+}
+#endif
 
 TEST(ErrorHandlerWithContentProviderTest, ErrorHandler) {
   Server svr;
@@ -11030,6 +12895,52 @@ static const char GZIPPED_HELLO_WORLD[] = {
     '\x08', '\xcf', '\x2f', '\xca', '\x49', '\x51', '\x04', '\x00',
     '\xa3', '\x1c', '\x29', '\x1c', '\x0c', '\x00', '\x00', '\x00'};
 
+// A content coding is a whole token, not something the field value merely
+// contains. Matching "br" and "zstd" as substrings made unrelated values such
+// as "fibre" look like Brotli, and turned a multi-coding value like
+// "gzip, br" into a Brotli-labeled body, so a decompressor was run over data
+// it was never meant to see.
+TEST(ContentEncodingTest, SubstringOfACodingIsNotTheCoding) {
+  const std::string body = "\xff\xd8\xff\xe0 not really a jpeg";
+
+  Server svr;
+
+  svr.Get("/fibre", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "fibre");
+  });
+
+  svr.Get("/multi", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "gzip, br");
+  });
+
+  svr.Get("/zstdish", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "x-zstd-ish");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  for (const char *path : {"/fibre", "/multi", "/zstdish"}) {
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << path << " -> " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << path;
+    // Not a coding we recognize, so the payload comes back untouched
+    EXPECT_EQ(body, res->body) << path;
+  }
+}
+
 // A content coding cpp-httplib recognizes but was not built with must be
 // reported as such. Handing the still-compressed payload back to the caller
 // would silently corrupt it.
@@ -11102,6 +13013,47 @@ TEST(ContentEncodingTest, KnownEncodingWithoutSupportIsReported) {
     ASSERT_FALSE(res);
     EXPECT_EQ(Error::UnsupportedContentEncoding, res.error());
 #endif
+  }
+}
+
+// RFC 9110 Section 5.3: a Content-Encoding split over several field lines is
+// the same message as the comma-joined one, so both have to be read the same
+// way. Reading only the first line made "gzip" followed by "gzip" look like a
+// single gzip coding, and a body the sender says was encoded twice was handed
+// back after one pass, still compressed but presented as decoded.
+TEST(ContentEncodingTest, DuplicateFieldLinesAreTheSameAsTheJoinedValue) {
+  const std::string body = "\xff\xd8\xff\xe0 not really a jpeg";
+
+  Server svr;
+  svr.Get("/split", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.headers.emplace("Content-Encoding", "gzip");
+    res.headers.emplace("Content-Encoding", "gzip");
+  });
+  svr.Get("/joined", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "gzip, gzip");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  // Two codings is not something cpp-httplib decodes, so both representations
+  // take the pass-through path rather than one of them being gunzipped once.
+  for (const char *path : {"/split", "/joined"}) {
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << path << " -> " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << path;
+    EXPECT_EQ(body, res->body) << path;
   }
 }
 
@@ -14847,6 +16799,211 @@ TEST(MultipartFormDataTest, ExcessivePartHeaders) {
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
 }
 
+TEST(MultipartFormDataTest, NoInitialBoundaryParsingIsNotQuadratic) {
+  // A body that never contains the declared boundary must not be accumulated
+  // while the parser waits for it. Buffering it would also make every read
+  // rescan everything seen so far, which is quadratic in the body size.
+  Server svr;
+  svr.Post("/post", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(60, 0);
+  cli.set_write_timeout(60, 0);
+
+  // '-' is the worst case: it matches the first character of the boundary, so
+  // every position has to be checked against it.
+  auto post_dashes = [&](size_t size) {
+    const std::string body(size, '-');
+    auto start = std::chrono::steady_clock::now();
+    auto res =
+        cli.Post("/post", body, "multipart/form-data; boundary=simpleboundary");
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    EXPECT_TRUE(res) << "Error: " << to_string(res.error());
+    if (res) { EXPECT_EQ(StatusCode::BadRequest_400, res->status); }
+    return ms;
+  };
+
+  // Not named `small`/`large`: <rpcndr.h> defines `small` as a macro on
+  // Windows.
+  auto ms_4mb = post_dashes(4u * 1024 * 1024);
+  auto ms_16mb = post_dashes(16u * 1024 * 1024);
+
+  // Comparing the two sizes rather than checking an absolute duration keeps
+  // this meaningful across build types and CI load, both of which move the
+  // absolute numbers by more than an order of magnitude. Four times the bytes
+  // costs about four times the time when parsing is linear, and about sixteen
+  // times when the body is buffered and rescanned.
+  ASSERT_GT(ms_4mb, 0) << "timer resolution too coarse to compare";
+  EXPECT_LT(ms_16mb, ms_4mb * 10)
+      << "4MB took " << ms_4mb << "ms but 16MB took " << ms_16mb
+      << "ms, which suggests the body is being buffered and rescanned";
+}
+
+TEST(MultipartFormDataTest, BoundaryNotFollowedByDelimiterFailsFast) {
+  // A boundary can only be followed by CRLF or by "--", so anything else is
+  // malformed no matter what comes next. The parser must say so right away
+  // instead of buffering the rest of the declared body.
+  Server svr;
+  svr.Post("/post", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Announce a 1 MB body but send only the malformed prefix. A parser that
+  // buffers instead of failing would still be waiting for the remaining bytes.
+  const std::string body = "--zzzz\r\n"
+                           "Content-Disposition: form-data; name=\"text1\"\r\n"
+                           "\r\n"
+                           "text1"
+                           "\r\n--zzzzXX";
+
+  const std::string req = "POST /post HTTP/1.1\r\n"
+                          "Content-Type: multipart/form-data; boundary=zzzz\r\n"
+                          "Content-Length: 1048576\r\n"
+                          "\r\n" +
+                          body;
+
+  std::string response;
+  ASSERT_TRUE(send_request(3, req, &response, port));
+  ASSERT_GE(response.size(), 12u) << "no response before the read timeout";
+  EXPECT_EQ("400", response.substr(9, 3));
+}
+
+// Posts a multipart body split into two writes, so that the server sees the
+// split at whatever offset the caller chose, and expects the single "text1"
+// field to come through.
+static void expect_split_multipart_ok(const std::string &body1,
+                                      const std::string &body2) {
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/post", [&](const Request &req, Response &) {
+    EXPECT_EQ(1u, req.form.fields.size());
+    EXPECT_EQ("text1", req.form.get_field("text1"));
+    handled = true;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+  });
+
+  svr.wait_until_ready();
+
+  // "Connection: close" makes the server close once it has answered, so the
+  // response drain ends immediately instead of idling until the read timeout.
+  const std::string head =
+      "POST /post HTTP/1.1\r\n"
+      "Content-Type: multipart/form-data; boundary=zzzz\r\n"
+      "Connection: close\r\n"
+      "Content-Length: " +
+      std::to_string(body1.size() + body2.size()) + "\r\n\r\n";
+
+  std::string response;
+  ASSERT_TRUE(send_request_in_parts(3, {head + body1, body2}, &response, port));
+  ASSERT_GE(response.size(), 12u) << "no response";
+  EXPECT_EQ("200", response.substr(9, 3));
+}
+
+TEST(MultipartFormDataTest, EpilogueSplitAcrossReadsIsIgnored) {
+  // RFC 2046: everything after the close-delimiter is an epilogue and is to be
+  // ignored, including when it does not arrive in the same read as the
+  // close-delimiter itself.
+  expect_split_multipart_ok("--zzzz\r\n"
+                            "Content-Disposition: form-data; name=\"text1\"\r\n"
+                            "\r\n"
+                            "text1"
+                            "\r\n--zzzz--",
+                            "\r\nthis epilogue must be ignored\r\n");
+}
+
+TEST(MultipartFormDataTest, InitialBoundarySplitAfterLongPreamble) {
+  // The initial boundary may be preceded by a preamble of any length and may
+  // straddle a read boundary. Discarding data while waiting for it must not
+  // throw away a partial boundary sitting at the end of the buffer.
+  expect_split_multipart_ok(std::string(64u * 1024, 'p') + "--zz",
+                            "zz\r\n"
+                            "Content-Disposition: form-data; name=\"text1\"\r\n"
+                            "\r\n"
+                            "text1"
+                            "\r\n--zzzz--\r\n");
+}
+
+TEST(MultipartFormDataTest, BoundaryLengthLimitIsEnforced) {
+  // The received boundary was only checked for being non-empty, so it could be
+  // as long as a header is allowed to be. The parser scans the body for
+  // "--" + boundary, so a body crafted to repeat that delimiter's leading bytes
+  // costs a nearly full comparison at nearly every position, making the
+  // boundary's length a multiplier on the worst-case parsing cost. RFC 2046
+  // 5.1.1 caps a boundary at 70 characters; honoring that caps the multiplier.
+  Server svr;
+  svr.Post("/post", [](const Request &req, Response &res) {
+    EXPECT_EQ(1u, req.form.fields.size());
+    EXPECT_EQ("text1", req.form.get_field("text1"));
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  auto post_with_boundary_of_length = [&](size_t len) {
+    const std::string boundary(len, 'a');
+    const std::string body =
+        "--" + boundary +
+        "\r\n"
+        "Content-Disposition: form-data; name=\"text1\"\r\n"
+        "\r\n"
+        "text1"
+        "\r\n--" +
+        boundary + "--\r\n";
+    return cli.Post("/post", body, "multipart/form-data; boundary=" + boundary);
+  };
+
+  auto res = post_with_boundary_of_length(70);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  res = post_with_boundary_of_length(71);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
+}
+
 TEST(MakeFileBodyTest, Basic) {
   const std::string file_content(4096, 'Z');
   const std::string tmp_path = "./httplib_test_make_file_body.bin";
@@ -14885,6 +17042,66 @@ TEST(MakeFileBodyTest, Basic) {
       cli.Post("/upload", fb.first, fb.second, "application/octet-stream");
   ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MakeFileBodyTest, TruncatedFileMakesTheProviderFail) {
+  const std::string path = "./httplib_test_make_file_body_truncated.bin";
+  {
+    std::ofstream ofs(path, std::ios::binary);
+    const std::string content(100, 'A');
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+  auto cleanup = detail::scope_exit([&] { std::remove(path.c_str()); });
+
+  auto body = make_file_body(path);
+  ASSERT_EQ(100u, body.first);
+  ASSERT_TRUE(static_cast<bool>(body.second));
+
+  // Rewritten shorter after its length was measured - and, on a server, after
+  // that length has already gone out as Content-Length.
+  {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    const std::string content(10, 'A');
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+
+  std::string written;
+  DataSink sink;
+  sink.write = [&](const char *d, size_t l) {
+    written.append(d, l);
+    return true;
+  };
+
+  // The provider has to report failure. write_content_with_progress() advances
+  // its offset only by what was written, so a provider that returns true
+  // without completing the length it promised is called again straight away,
+  // and again.
+  EXPECT_FALSE(body.second(0, body.first, sink));
+  EXPECT_EQ(std::string(10, 'A'), written);
+}
+
+TEST(MakeFileBodyTest, WholeFileIsSent) {
+  const std::string path = "./httplib_test_make_file_body_whole.bin";
+  const std::string content(9000, 'Z'); // spans more than one 8 KiB read
+  {
+    std::ofstream ofs(path, std::ios::binary);
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+  auto cleanup = detail::scope_exit([&] { std::remove(path.c_str()); });
+
+  auto body = make_file_body(path);
+  ASSERT_EQ(content.size(), body.first);
+  ASSERT_TRUE(static_cast<bool>(body.second));
+
+  std::string written;
+  DataSink sink;
+  sink.write = [&](const char *d, size_t l) {
+    written.append(d, l);
+    return true;
+  };
+
+  EXPECT_TRUE(body.second(0, body.first, sink));
+  EXPECT_EQ(content, written);
 }
 
 TEST(TaskQueueTest, IncreaseAtomicInteger) {
@@ -16007,6 +18224,73 @@ TEST(InvalidHeaderValueTest, InvalidContentLength) {
             response.substr(0, response.find("\r\n")));
 }
 
+// RFC 9110 Section 10.1.1: Expect is a comma-separated list, its value is
+// case-insensitive, and a server that receives a 100-continue expectation in
+// an HTTP/1.0 request MUST ignore it.
+static void probe_expect(int port, const std::string &req, bool *got_100) {
+  std::string response;
+  ASSERT_TRUE(send_request(1, req, &response, port));
+  *got_100 = response.find("100 Continue") != std::string::npos;
+}
+
+class ExpectTokenTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    svr_.Post("/p", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+    port_ = svr_.bind_to_any_port(HOST);
+    thread_ = thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+  void TearDown() override {
+    svr_.stop();
+    if (thread_.joinable()) { thread_.join(); }
+  }
+
+  std::string request(const char *version, const char *expect_value) const {
+    return std::string("POST /p ") + version +
+           "\r\n"
+           "Host: localhost\r\n"
+           "Content-Length: 2\r\n"
+           "Connection: close\r\n"
+           "Expect: " +
+           expect_value +
+           "\r\n"
+           "\r\n"
+           "hi";
+  }
+
+  Server svr_;
+  int port_ = 0;
+  thread thread_;
+};
+
+TEST_F(ExpectTokenTest, Http11GetsTheInterimResponse) {
+  bool got_100 = false;
+  probe_expect(port_, request("HTTP/1.1", "100-continue"), &got_100);
+  EXPECT_TRUE(got_100);
+}
+
+TEST_F(ExpectTokenTest, Http10ExpectationIsIgnored) {
+  bool got_100 = true;
+  probe_expect(port_, request("HTTP/1.0", "100-continue"), &got_100);
+  EXPECT_FALSE(got_100);
+}
+
+TEST_F(ExpectTokenTest, ExpectationIsCaseInsensitive) {
+  bool got_100 = false;
+  probe_expect(port_, request("HTTP/1.1", "100-Continue"), &got_100);
+  EXPECT_TRUE(got_100);
+}
+
+TEST_F(ExpectTokenTest, ExpectationAmongOthersIsRecognized) {
+  bool got_100 = false;
+  probe_expect(port_, request("HTTP/1.1", "100-continue, foo"), &got_100);
+  EXPECT_TRUE(got_100);
+}
+
 #ifndef _WIN32
 TEST(Expect100ContinueTest, ServerClosesConnection) {
   static constexpr char reject[] = "Unauthorized";
@@ -16560,6 +18844,61 @@ TEST(HeaderSmugglingTest, ChunkedTrailerHeadersMerged) {
   ASSERT_TRUE(send_request(1, req, &res));
 }
 
+// RFC 9110 Section 5.2 and 5.3: a comma-separated list field may be sent as
+// several field lines, and the combined value is what has to be parsed. A
+// Trailer field split across lines therefore declares every name it lists;
+// reading only the first line silently drops the trailers the later lines
+// declare. The prohibited-trailer filter still applies to every line.
+TEST(HeaderSmugglingTest, DuplicateTrailerFieldLinesDeclareAllTrailers) {
+  Server svr;
+
+  size_t observed_trailer_count = 0;
+  std::string observed_hello;
+  std::string observed_world;
+  bool observed_content_length = true;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_trailer_count = req.trailers.size();
+    observed_hello = req.get_trailer_value("X-Hello");
+    observed_world = req.get_trailer_value("X-World");
+    observed_content_length = req.has_trailer("Content-Length");
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  const std::string req = "GET / HTTP/1.1\r\n"
+                          "Transfer-Encoding: chunked\r\n"
+                          "Trailer: X-Hello\r\n"
+                          "Trailer: X-World, Content-Length\r\n"
+                          "\r\n"
+                          "0\r\n"
+                          "X-Hello: hello\r\n"
+                          "X-World: world\r\n"
+                          "Content-Length: 10\r\n"
+                          "\r\n";
+
+  std::string res;
+  ASSERT_TRUE(send_request(1, req, &res, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", res.substr(0, 15));
+
+  // Accepted: both field lines contribute to the declared set
+  EXPECT_EQ(2U, observed_trailer_count);
+  EXPECT_EQ(observed_hello, "hello");
+  EXPECT_EQ(observed_world, "world");
+
+  // Denied: a prohibited name stays prohibited on a later field line
+  EXPECT_FALSE(observed_content_length);
+}
+
 // A direct client that is not listed in trusted_proxies must not be able to
 // spoof req.remote_addr by sending an arbitrary X-Forwarded-For header. Only
 // the peer address on the actual TCP connection determines whether the
@@ -16879,6 +19218,69 @@ TEST(ForwardedHeadersTest, HandlesWhitespaceAroundIPs) {
   EXPECT_EQ(observed_remote_addr, "203.0.113.66");
 }
 
+// RFC 9110 Section 5.2 and 5.3: repeated field lines carry the same meaning as
+// one comma-joined value, in the order received. Proxies such as HAProxy append
+// their own X-Forwarded-For as a separate field line rather than extending the
+// one the client sent, so every occurrence has to be taken into account.
+// Reading only the first one hands back the address the client chose.
+TEST(ForwardedHeadersTest, DuplicateFieldLines_JoinsAllOccurrences) {
+  Server svr;
+
+  svr.set_trusted_proxies({"192.0.2.45", "::1", "127.0.0.1"});
+
+  std::string observed_remote_addr;
+  size_t observed_xff_count = 0;
+
+  svr.Get("/ip", [&](const Request &req, Response &res) {
+    observed_remote_addr = req.remote_addr;
+    observed_xff_count = req.get_header_value_count("X-Forwarded-For");
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // The client supplies the first field line; the trusted proxy appends the
+  // address it observed as a second one.
+  std::string raw_req = "GET /ip HTTP/1.1\r\n"
+                        "Host: localhost\r\n"
+                        "X-Forwarded-For: 1.2.3.4\r\n"
+                        "X-Forwarded-For: 198.51.100.23, 192.0.2.45\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+
+  std::string out;
+  ASSERT_TRUE(send_request(5, raw_req, &out, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+
+  EXPECT_EQ(observed_xff_count, 2U);
+  EXPECT_EQ(observed_remote_addr, "198.51.100.23");
+
+  // The same chain spread over one field line per hop derives the same client
+  // address, i.e. the split and the comma-joined representations agree.
+  std::string per_hop_req = "GET /ip HTTP/1.1\r\n"
+                            "Host: localhost\r\n"
+                            "X-Forwarded-For: 1.2.3.4\r\n"
+                            "X-Forwarded-For: 198.51.100.23\r\n"
+                            "X-Forwarded-For: 192.0.2.45\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+  out.clear();
+  ASSERT_TRUE(send_request(5, per_hop_req, &out, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+
+  EXPECT_EQ(observed_xff_count, 3U);
+  EXPECT_EQ(observed_remote_addr, "198.51.100.23");
+}
+
 // An X-Forwarded-For header whose value parses to zero IP segments must not
 // crash the server (it used to call front() on an empty vector inside
 // get_client_ip). The connection-level remote address must be retained instead.
@@ -16925,6 +19327,270 @@ TEST(ForwardedHeadersTest, CommaOnlyXForwardedFor_DoesNotCrash) {
 TEST(ForwardedHeadersTest, MultipleCommasXForwardedFor_DoesNotCrash) {
   run_malformed_xff_test(", , ,");
 }
+
+// The same rule applies to Accept: a request whose acceptable types are spread
+// over several field lines must be negotiated against all of them.
+// RFC 9110 Section 7.6.1: Connection carries a comma-separated list of
+// case-insensitive connection options. Comparing the whole field value against
+// one option misses a client that sends several of them, and misses every
+// casing but the one written in the comparison.
+//
+// Sends req, reads the response, then reuses the same socket for a second
+// request to find out whether the server kept the connection.
+static void probe_connection_reuse(int port, const std::string &req,
+                                   bool *announced_close, bool *reusable) {
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/5, 0,
+      /*read_timeout_sec=*/1, 0,
+      /*write_timeout_sec=*/5, 0, std::string(), error);
+  ASSERT_NE(sock, INVALID_SOCKET);
+  auto se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  const std::string second = "GET /keepalive HTTP/1.1\r\n"
+                             "Host: localhost\r\n"
+                             "Connection: close\r\n"
+                             "\r\n";
+  std::string first_response;
+  std::string second_response;
+
+  detail::process_client_socket(
+      sock, 1, 0, 5, 0, 0, std::chrono::steady_clock::time_point::min(),
+      [&](Stream &strm) {
+        if (strm.write(req.data(), req.size()) !=
+            static_cast<ssize_t>(req.size())) {
+          return false;
+        }
+
+        char buf[512];
+        detail::stream_line_reader reader(strm, buf, sizeof(buf));
+        // Headers plus the two-byte body of the handler below
+        while (reader.getline()) {
+          first_response += reader.ptr();
+          if (first_response.find("ok") != std::string::npos) { break; }
+        }
+
+        if (strm.write(second.data(), second.size()) !=
+            static_cast<ssize_t>(second.size())) {
+          return true;
+        }
+        detail::stream_line_reader reader2(strm, buf, sizeof(buf));
+        while (reader2.getline()) {
+          second_response += reader2.ptr();
+          if (second_response.find("ok") != std::string::npos) { break; }
+        }
+        return true;
+      });
+
+  *announced_close =
+      first_response.find("Connection: close") != std::string::npos;
+  *reusable = second_response.find("HTTP/1.1 200") != std::string::npos;
+}
+
+class ConnectionTokenTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    svr_.Get("/keepalive", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+    port_ = svr_.bind_to_any_port(HOST);
+    thread_ = thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+  void TearDown() override {
+    svr_.stop();
+    if (thread_.joinable()) { thread_.join(); }
+  }
+
+  Server svr_;
+  int port_ = 0;
+  thread thread_;
+};
+
+// "close" alongside another option still closes the connection, and the
+// response says so rather than leaving the peer to discover it.
+TEST_F(ConnectionTokenTest, CloseAmongSeveralOptionsIsHonored) {
+  bool announced_close = false;
+  bool reusable = true;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: keep-alive, close\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_TRUE(announced_close);
+  EXPECT_FALSE(reusable);
+}
+
+// "close" split over two field lines is the same list, so it is honored too.
+TEST_F(ConnectionTokenTest, CloseOnALaterFieldLineIsHonored) {
+  bool announced_close = false;
+  bool reusable = true;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: keep-alive\r\n"
+                         "Connection: close\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_TRUE(announced_close);
+  EXPECT_FALSE(reusable);
+}
+
+// Connection options are case-insensitive, so an HTTP/1.0 client asking for
+// keep-alive in the spelling everyone actually sends keeps its connection.
+TEST_F(ConnectionTokenTest, Http10KeepAliveIsCaseInsensitive) {
+  bool announced_close = false;
+  bool reusable = false;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.0\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: keep-alive\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_FALSE(announced_close);
+  EXPECT_TRUE(reusable);
+}
+
+// A token the value merely contains is not the token itself.
+TEST_F(ConnectionTokenTest, SubstringOfAnOptionIsNotTheOption) {
+  bool announced_close = false;
+  bool reusable = false;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: notclose\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_FALSE(announced_close);
+  EXPECT_TRUE(reusable);
+}
+
+TEST(RepeatedFieldLinesTest, AcceptCombinesEveryFieldLine) {
+  Server svr;
+
+  std::vector<std::string> observed_types;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_types = req.accept_content_types;
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  Headers headers;
+  headers.emplace("Accept", "text/plain;q=0.5");
+  headers.emplace("Accept", "application/json");
+
+  auto res = cli.Get("/", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  // Sorted by q-value, so the second field line's type comes first
+  ASSERT_EQ(2U, observed_types.size());
+  EXPECT_EQ("application/json", observed_types[0]);
+  EXPECT_EQ("text/plain", observed_types[1]);
+}
+
+// RFC 9110 Section 5.6.1.2: empty list elements are parsed and ignored, so an
+// empty field line must not contribute a bare comma to the combined value.
+TEST(RepeatedFieldLinesTest, EmptyFieldLineDoesNotInjectComma) {
+  Server svr;
+
+  std::vector<std::string> observed_types;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_types = req.accept_content_types;
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Empty first field line, then a real one
+  std::string raw_req = "GET / HTTP/1.1\r\n"
+                        "Host: localhost\r\n"
+                        "Accept:\r\n"
+                        "Accept: application/json\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+
+  std::string out;
+  ASSERT_TRUE(send_request(5, raw_req, &out, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+
+  ASSERT_EQ(1U, observed_types.size());
+  EXPECT_EQ("application/json", observed_types[0]);
+}
+
+// The skip in get_combined_header_value() is what keeps an empty field line
+// from contributing a bare comma. Only a trailing empty field line exercises
+// it: a leading one is already covered by the "combined is still empty" check,
+// and parse_accept_header() now ignores the empty element either way, so the
+// request-level test above can no longer tell the two apart.
+TEST(RepeatedFieldLinesTest, EmptyFieldLineIsNotCombined) {
+  Headers headers;
+  headers.emplace("Accept", "text/html");
+  headers.emplace("Accept", "");
+  EXPECT_EQ("text/html", detail::get_combined_header_value(headers, "Accept"));
+
+  headers.clear();
+  headers.emplace("Accept", "");
+  headers.emplace("Accept", "application/json");
+  EXPECT_EQ("application/json",
+            detail::get_combined_header_value(headers, "Accept"));
+}
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+// An encoding offered on a later Accept-Encoding field line is still offered.
+TEST(RepeatedFieldLinesTest, AcceptEncodingCombinesEveryFieldLine) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content(std::string(1024, 'x'), "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+
+  Headers headers;
+  headers.emplace("Accept-Encoding", "identity");
+  headers.emplace("Accept-Encoding", "gzip");
+
+  auto res = cli.Get("/", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+}
+#endif
 
 #ifndef _WIN32
 TEST(ServerRequestParsingTest, RequestWithoutContentLengthOrTransferEncoding) {
@@ -18214,6 +20880,16 @@ TEST(ETagTest, StaticFileETagAndIfNoneMatch) {
   auto res5 = cli.Get("/static/etag_testfile.txt", h5);
   ASSERT_TRUE(res5);
   EXPECT_EQ(304, res5->status);
+
+  // The ETag list split over several field lines: RFC 9110 Section 5.3 makes
+  // that equivalent to the single comma-separated list above, so the match on
+  // the second line must still be found.
+  Headers h6;
+  h6.emplace("If-None-Match", "W/\"other\"");
+  h6.emplace("If-None-Match", etag);
+  auto res6 = cli.Get("/static/etag_testfile.txt", h6);
+  ASSERT_TRUE(res6);
+  EXPECT_EQ(304, res6->status);
 
   svr.stop();
   t.join();
@@ -20664,6 +23340,20 @@ TEST_F(WebSocketIntegrationTest, SubProtocolNegotiation) {
   client.close();
 }
 
+TEST_F(WebSocketIntegrationTest, SubProtocolSplitAcrossFieldLines) {
+  Headers headers;
+  headers.emplace("Sec-WebSocket-Protocol", "mqtt");
+  headers.emplace("Sec-WebSocket-Protocol", "graphql-ws");
+  ws::WebSocketClient client(
+      "ws://localhost:" + std::to_string(port_) + "/ws-subprotocol", headers);
+  ASSERT_TRUE(client.connect());
+
+  // The offer on the second field line counts too, so graphql-ws is selected
+  EXPECT_EQ("graphql-ws", client.subprotocol());
+
+  client.close();
+}
+
 TEST_F(WebSocketIntegrationTest, SubProtocolNoMatch) {
   Headers headers = {{"Sec-WebSocket-Protocol", "mqtt, wamp"}};
   ws::WebSocketClient client(
@@ -20967,6 +23657,132 @@ TEST(WebSocketTest, InvalidHeaderInHandshakeWritesNothing) {
   EXPECT_EQ(0, received);
 }
 
+TEST(WebSocketTest, ConnectionHeaderNeedsCompleteUpgradeToken) {
+  // RFC 6455 4.2.1: Connection is a token list, so a value that merely
+  // contains "upgrade" as a substring is a different token and must not
+  // start a WebSocket handshake.
+  auto make_request = [](const std::vector<std::string> &connection_values) {
+    Request req;
+    req.method = "GET";
+    req.headers.emplace("Upgrade", "websocket");
+    for (const auto &value : connection_values) {
+      req.headers.emplace("Connection", value);
+    }
+    req.headers.emplace("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    req.headers.emplace("Sec-WebSocket-Version", "13");
+    return req;
+  };
+
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"Upgrade"})));
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"upgrade"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"keep-alive, Upgrade"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"Upgrade , keep-alive"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"keep-alive", "Upgrade"})));
+
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"notupgrade"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"upgrade-not"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"xupgrade"})));
+  EXPECT_FALSE(
+      detail::is_websocket_upgrade(make_request({"keep-alive, notupgrade"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"close"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({})));
+}
+
+TEST(WebSocketTest, UpgradeHeaderNeedsCompleteWebsocketToken) {
+  // RFC 9110 7.8 defines Upgrade as a comma-separated list of protocols and
+  // asks recipients to match each protocol-name case-insensitively, and RFC
+  // 6455 4.2.1 asks for a header field containing the value "websocket". A
+  // client naming websocket alongside another protocol, or on a second field
+  // line, is offering websocket; a value that merely contains "websocket" as a
+  // substring is a different protocol name and is not.
+  auto make_request = [](const std::vector<std::string> &upgrade_values) {
+    Request req;
+    req.method = "GET";
+    for (const auto &value : upgrade_values) {
+      req.headers.emplace("Upgrade", value);
+    }
+    req.headers.emplace("Connection", "Upgrade");
+    req.headers.emplace("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    req.headers.emplace("Sec-WebSocket-Version", "13");
+    return req;
+  };
+
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"websocket"})));
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"WebSocket"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"websocket, HTTP/3.0"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"HTTP/3.0 , websocket"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"HTTP/3.0", "websocket"})));
+
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"notwebsocket"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"websocket-2"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"xwebsocket"})));
+  EXPECT_FALSE(
+      detail::is_websocket_upgrade(make_request({"HTTP/3.0, notwebsocket"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"h2c"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({})));
+}
+
+TEST(WebSocketTest, ServerRejectsHandshakeWithoutUpgradeToken) {
+  Server svr;
+  svr.WebSocket("/ws", [](const Request &, ws::WebSocket &) {});
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Headers headers = {{"Upgrade", "websocket"},
+                     {"Connection", "notupgrade"},
+                     {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="},
+                     {"Sec-WebSocket-Version", "13"}};
+
+  Client cli("localhost", port);
+  auto res = cli.Get("/ws", headers);
+
+  // The route exists only as a WebSocket route, so a request that fails the
+  // handshake check falls through to ordinary routing.
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST(WebSocketTest, ClientRejectsResponseWithoutUpgradeToken) {
+  // The peer answers 101 with a correct Sec-WebSocket-Accept, so the
+  // Connection value is the only thing left for the client to reject.
+  Server svr;
+  svr.Get("/ws", [](const Request &req, Response &res) {
+    res.status = StatusCode::SwitchingProtocol_101;
+    res.set_header("Upgrade", "websocket");
+    res.set_header("Connection", "notupgrade");
+    res.set_header("Sec-WebSocket-Accept",
+                   detail::websocket_accept_key(
+                       req.get_header_value("Sec-WebSocket-Key")));
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+
+  auto res = client.connect();
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::WebSocketHandshake, res.error());
+  EXPECT_FALSE(client.is_open());
+}
+
 TEST(WebSocketTest, HostHeaderOverUnixSocket) {
   // The socket path doubles as the URL host, so it must not contain '/'.
   const char *shard = getenv("GTEST_SHARD_INDEX");
@@ -21013,6 +23829,166 @@ TEST(WebSocketTest, HostHeaderOverUnixSocket) {
     // There is no host:port for a Unix socket, so the same "localhost"
     // placeholder the HTTP client uses is expected.
     EXPECT_EQ("localhost", received_host);
+  }
+}
+
+// Two threads must never parse WebSocket frames from the same stream.
+// close() used to read the peer's Close reply with its own frame read, so it
+// raced a reader thread that was in the middle of a payload: the payload loop
+// in read_websocket_frame() keeps reading until payload_len bytes are in hand,
+// so bytes taken by close() were replaced with bytes from further along the
+// stream. The message kept its length and silently changed content.
+//
+// The raw peer below sends a frame header plus part of the payload, waits for
+// the handler to call close(), and only then sends the rest. Whichever thread
+// would win the race for those bytes, the message must arrive intact, because
+// close() must not touch the stream while read() owns it.
+TEST(WebSocketTest, CloseDoesNotStealBytesFromConcurrentRead) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+
+  const size_t payload_len = 120; // fits the 7-bit length field
+  const size_t prefix_len = 8;
+  const int attempts = 8;
+
+  std::string expected(payload_len, '\0');
+  for (size_t i = 0; i < payload_len; i++) {
+    expected[i] = static_cast<char>('a' + i % 26);
+  }
+
+  std::atomic<bool> peer_stalled{false};
+  std::atomic<bool> handler_done{false};
+  std::mutex received_mutex;
+  std::vector<std::string> received;
+
+  // Bound every wait, so a regression fails the test instead of hanging the
+  // suite.
+  auto wait_for = [](const std::atomic<bool> &flag) {
+    for (int i = 0; i < 500 && !flag; i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  };
+
+  Server svr;
+  svr.set_websocket_ping_interval(0);
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &ws) {
+    std::thread reader([&]() {
+      std::string msg;
+      while (ws.read(msg)) {
+        std::lock_guard<std::mutex> guard(received_mutex);
+        received.push_back(msg);
+      }
+    });
+
+    // Wait until the peer stalls mid-payload, so the reader thread is parked
+    // inside read_websocket_frame() when close() runs.
+    wait_for(peer_stalled);
+    ws.close();
+    reader.join();
+    handler_done = true;
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto send_bytes = [](socket_t s, const std::string &data) {
+#ifdef _WIN32
+    auto n = ::send(s, data.data(), static_cast<int>(data.size()), 0);
+#else
+    auto n = ::send(s, data.data(), data.size(), 0);
+#endif
+    return n == static_cast<decltype(n)>(data.size());
+  };
+
+  // Frame header with an all-zero mask key, so the payload goes out verbatim.
+  // Every length used here fits the 7-bit length field.
+  auto masked_header = [](uint8_t first_byte, size_t len) {
+    std::string h;
+    h += static_cast<char>(first_byte);
+    h += static_cast<char>(0x80 | len); // masked, 7-bit length
+    h.append(4, '\0');                  // mask key
+    return h;
+  };
+
+  for (int attempt = 0; attempt < attempts; attempt++) {
+    peer_stalled = false;
+    handler_done = false;
+
+    auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_NE(INVALID_SOCKET, sock) << "attempt " << attempt;
+    auto se_sock = detail::scope_exit([&] {
+      if (sock != INVALID_SOCKET) { detail::close_socket(sock); }
+    });
+    detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
+    detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, 5, 0);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    ASSERT_EQ(
+        0, ::connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)))
+        << "attempt " << attempt;
+
+    ASSERT_TRUE(send_bytes(sock,
+                           "GET /ws HTTP/1.1\r\n"
+                           "Host: 127.0.0.1\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n"
+                           "Sec-WebSocket-Version: 13\r\n"
+                           "\r\n"))
+        << "attempt " << attempt;
+
+    std::string response;
+    while (response.find("\r\n\r\n") == std::string::npos) {
+      char buf[512];
+      auto n = ::recv(sock, buf, static_cast<int>(sizeof(buf)), 0);
+      if (n <= 0) { break; }
+      response.append(buf, static_cast<size_t>(n));
+    }
+    ASSERT_NE(std::string::npos, response.find(" 101 "))
+        << "attempt " << attempt;
+
+    // Send the header of a Binary message but only the first prefix_len bytes
+    // of its payload, leaving the reader thread stalled inside the payload.
+    ASSERT_TRUE(send_bytes(sock, masked_header(0x82, payload_len) +
+                                     expected.substr(0, prefix_len)))
+        << "attempt " << attempt;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    peer_stalled = true;
+    // Let close() send its Close frame and park in its own read before the
+    // rest of the payload arrives, so both threads are waiting for it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::string close_frame = masked_header(0x88, 2); // FIN + Close
+    close_frame += static_cast<char>(0x03);           // status 1000
+    close_frame += static_cast<char>(0xE8);
+    ASSERT_TRUE(send_bytes(sock, expected.substr(prefix_len) + close_frame))
+        << "attempt " << attempt;
+
+    // Closing the peer releases the reader thread even on the buggy path,
+    // where it waits for bytes another thread already consumed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    detail::close_socket(sock);
+    sock = INVALID_SOCKET;
+
+    wait_for(handler_done);
+    ASSERT_TRUE(handler_done) << "attempt " << attempt;
+  }
+
+  std::lock_guard<std::mutex> guard(received_mutex);
+  EXPECT_EQ(static_cast<size_t>(attempts), received.size())
+      << "a message in flight when close() ran was dropped";
+  for (size_t i = 0; i < received.size(); i++) {
+    EXPECT_EQ(expected, received[i]) << "message " << i;
   }
 }
 

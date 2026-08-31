@@ -307,6 +307,39 @@ int main(void)
 
 `Post`, `Put`, `Patch`, `Delete` and `Options` methods are also supported.
 
+### Custom HTTP methods
+
+Methods outside the built-in set are rejected with `400 Bad Request` unless a handler is registered for them with `CustomRoute`. This covers the WebDAV methods of RFC 4918, `SUBSCRIBE` and friends from UPnP, and any other extension method.
+
+```c++
+svr.CustomRoute("PROPFIND", "/dav/:id", [](const Request& req, Response& res) {
+  // The request body is available as usual
+  auto id = req.path_params.at("id");
+  res.status = StatusCode::MultiStatus_207;
+  res.set_content(build_multistatus(req.body), "application/xml");
+});
+
+// A content reader overload is available too
+svr.CustomRoute("REPORT", "/dav/.*",
+                [](const Request& req, Response& res,
+                   const ContentReader& content_reader) {
+                  content_reader([&](const char* data, size_t data_length) {
+                    // ...
+                    return true;
+                  });
+                });
+```
+
+Patterns work exactly as they do for `Get` and the other methods, so regular expressions and path parameters are both available.
+
+Note the following:
+
+* The method name must be a valid HTTP method token (RFC 9110) and must be registered before `listen()` is called.
+* `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, `PATCH` and `PRI` cannot be registered this way. Use the dedicated methods above instead.
+* A rejected registration makes `is_valid()` return `false`, and `listen()` then fails rather than starting a server with a route that would never fire.
+* Static file serving and WebSocket upgrades remain `GET`/`HEAD` only.
+* `Allow` and the WebDAV `DAV:` header are not generated automatically. Register an `Options` handler if clients need them.
+
 ### Bind a socket to multiple interfaces and any available port
 
 ```cpp
@@ -413,6 +446,8 @@ svr.set_pre_compression_logger([](const httplib::Request& req, const httplib::Re
 ```
 
 The pre-compression logger is only called when compression would be applied. For responses without compression, only the access logger is called.
+
+For a static file response (see [Static file compression](#static-file-compression)), `res.body` is empty when the logger runs. The bytes are still on disk at that point, not in memory.
 
 #### Error Logging
 
@@ -694,6 +729,12 @@ svr.Post("/content_receiver",
     }
   });
 ```
+
+`CPPHTTPLIB_MULTIPART_FORM_DATA_FILE_MAX_COUNT` (default 1024) caps the number of
+form-data parts only on the buffered path, where every part is accumulated into
+`req.form`. The content receiver keeps nothing, so the cap does not apply here.
+If your handler needs an upper bound on the number of parts, count them yourself
+and return `false` from the callback to stop the parser.
 
 ### Send content with the content provider
 
@@ -1433,6 +1474,32 @@ The server can apply compression to the following MIME type contents:
 - application/protobuf
 - application/xhtml+xml
 
+### Static file compression
+
+Responses served from a file, whether through `set_mount_point()` or `Response::set_file_content()`, are sent as is by default. Turn compression on for them with:
+
+```c++
+svr.set_static_file_compression(true);
+```
+
+Only files within a size range are compressed, and both ends of it can be moved:
+
+```c++
+svr.set_static_file_compression_min_length(512);
+svr.set_static_file_compression_max_length(1024 * 1024);
+```
+
+The lower bound defaults to 1400 bytes. A response that already fits in a single 1500-byte MTU is not delivered any faster for being smaller, and a file of a few bytes comes back larger than it went in, since gzip's header and trailer outweigh what deflate saves. `0` compresses everything down to a single byte, and `CPPHTTPLIB_STATIC_FILE_COMPRESSION_MIN_LENGTH` sets the default at compile time. An empty file is never compressed regardless.
+
+The upper bound defaults to 4MB, and exists for a different reason: the file is compressed per request, and the compressed bytes are held in memory until the response has been written, so the peak cost scales with the number of requests in flight. It is a bound on what one request can cost, not a statement about how well large files compress, which is why raising it is reasonable when the files are known and the traffic is not. `0` removes the limit, and `CPPHTTPLIB_STATIC_FILE_COMPRESSION_MAX_LENGTH` sets the default at compile time.
+
+A compressed response keeps its `Content-Length`, so `HEAD` still reports the size a `GET` would return. Two details are worth knowing:
+
+- Range requests are answered from the uncompressed representation, so `Content-Range` keeps naming the file's own bytes.
+- The `ETag` carries the coding it belongs to (`W/"...-gzip"`), so a client that cached the compressed form revalidates against the right validator.
+
+Content providers registered with `set_content_provider()` are not covered. Feeding one through a compressor would hold each write back until the compressor's window filled, which breaks providers that produce their body incrementally. Use `set_chunked_content_provider()` to compress a generated body.
+
 ### Zlib Support
 
 'gzip' compression is available with `CPPHTTPLIB_ZLIB_SUPPORT`. `libz` should be linked.
@@ -1481,7 +1548,6 @@ res->body; // Compressed data
 Unix Domain Socket Support
 --------------------------
 
-Unix Domain Socket support is available on Linux and macOS.
 
 ```c++
 // Server

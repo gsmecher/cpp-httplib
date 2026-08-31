@@ -114,6 +114,9 @@ jobs:
       - name: build and run WebSocket heartbeat test
         if: matrix.tls_backend == 'openssl'
         run: cd test && make test_websocket_heartbeat && ./test_websocket_heartbeat
+      - name: build and run WebSocket TLS thread safety test
+        if: matrix.tls_backend == 'openssl'
+        run: cd test && make test_websocket_thread_safety && ./test_websocket_thread_safety
       - name: build and run ThreadPool test
         run: cd test && make test_thread_pool && ./test_thread_pool
 
@@ -414,6 +417,9 @@ jobs:
       - name: build and run WebSocket heartbeat test
         if: matrix.tls_backend == 'openssl'
         run: cd test && make test_websocket_heartbeat && ./test_websocket_heartbeat
+      - name: build and run WebSocket TLS thread safety test
+        if: matrix.tls_backend == 'openssl'
+        run: cd test && make test_websocket_thread_safety && ./test_websocket_thread_safety
       - name: build and run ThreadPool test
         run: cd test && make test_thread_pool && ./test_thread_pool
 
@@ -518,7 +524,52 @@ jobs:
       run: vcpkg install gtest curl zlib brotli zstd
     - name: Install OpenSSL
       if: ${{ matrix.config.with_ssl }}
-      run: choco install openssl
+      shell: pwsh
+      run: |
+        # Chocolatey's openssl package hardcodes a versioned slproweb URL, and
+        # slproweb keeps only the newest build of each branch. The package
+        # therefore 404s on every OpenSSL release until someone respins it.
+        # Read slproweb's own manifest instead: it is updated at the same time
+        # as the downloads it points at, so the URL is always live.
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is slow with it
+
+        $manifest = 'https://raw.githubusercontent.com/slproweb/opensslhashes/master/win32_openssl_hashes.json'
+        $entry = (Invoke-RestMethod $manifest).files.PSObject.Properties.Value |
+          Where-Object {
+            $_.bits -eq 64 -and $_.arch -eq 'INTEL' -and
+            -not $_.light -and $_.installer -eq 'exe' -and $_.basever -like '4.*'
+          } |
+          Sort-Object { [version]$_.basever } | Select-Object -Last 1
+        if (-not $entry) { throw 'No 64-bit OpenSSL 4.x installer found in the manifest' }
+        Write-Host "Installing OpenSSL $($entry.basever) from $($entry.url)"
+
+        $installer = Join-Path $env:RUNNER_TEMP 'Win64OpenSSL.exe'
+        Invoke-WebRequest $entry.url -OutFile $installer
+        $actual = (Get-FileHash $installer -Algorithm SHA512).Hash.ToLower()
+        if ($actual -ne $entry.sha512.ToLower()) {
+          throw "SHA512 mismatch: expected $($entry.sha512), got $actual"
+        }
+
+        # Same silent flags the Chocolatey package used. The installer is Inno
+        # Setup, so /DIR pins the location CMake already looks in. The inner
+        # quotes matter: ArgumentList joins on spaces, so an unquoted /DIR
+        # would install to C:\Program and only fail later, at load time.
+        $dir = 'C:\Program Files\OpenSSL'
+        $proc = Start-Process $installer -Wait -PassThru -ArgumentList `
+          '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$dir`""
+        if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
+
+        # Catch a misplaced install here rather than at link or load time.
+        if (-not (Test-Path "$dir\lib\VC\x64\MD\libcrypto.lib")) {
+          throw "OpenSSL import libraries missing under $dir"
+        }
+        if (-not (Get-ChildItem "$dir\bin\libcrypto-*.dll" -ErrorAction SilentlyContinue)) {
+          throw "OpenSSL runtime DLLs missing under $dir\bin"
+        }
+
+        "$dir\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+        "OPENSSL_CONF=$dir\bin\openssl.cfg" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
     - name: Configure CMake ${{ matrix.config.name }}
       run: >
         cmake -B build -S .
@@ -534,6 +585,7 @@ jobs:
     - name: Build ${{ matrix.config.name }}
       run: cmake --build build --config Release -- /v:m /clp:ShowCommandLine
     - name: Run tests ${{ matrix.config.name }}
+      id: run_tests
       if: ${{ matrix.config.run_tests }}
       shell: pwsh
       working-directory: build/test
@@ -567,7 +619,10 @@ jobs:
         if ($failed) { exit 1 }
         Write-Host "All shards passed."
     - name: Report flaky failure on issue #2533
-      if: failure() && matrix.config.name == 'without SSL' && github.event_name == 'push'
+      if: >
+        failure() && steps.run_tests.conclusion == 'failure'
+        && matrix.config.name == 'without SSL'
+        && github.event_name == 'push'
       continue-on-error: true
       shell: pwsh
       working-directory: build/test
@@ -585,7 +640,8 @@ jobs:
           }
         }
         if (-not $summary) {
-          $summary = "_Could not extract failed test name from shard logs; see the run for details._`n`n"
+          Write-Host "No [  FAILED  ] line in any shard log; not a test failure. Skipping the report."
+          exit 0
         }
         $runUrl = "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)"
         $body = "Reoccurred on push: $runUrl`n`nCommit: $($env:GITHUB_SHA)`n`n$summary"
